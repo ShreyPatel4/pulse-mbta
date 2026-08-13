@@ -1,0 +1,89 @@
+{
+  "contract_version": "1",
+  "source": "MBTA V3 API, GET /predictions?include=schedule,vehicle",
+  "description": "Describes the exact fields pulse.mbta.map_rows reads out of a /predictions JSON:API page (one page = one HTTP response's parsed JSON body, before pulse.mbta.fetch_predictions merges pages together). Enforced by pulse.contract.validate_page against a live payload page; a silent MBTA schema change should surface as a named poll_runs error, not as a rising skipped/null count with no explanation. Only resource_types actually read by map_rows are covered -- route/stop/trip/vehicle resources appear in `included` but map_rows only ever reads their relationship *id*, never their own attributes, so a schema change confined to those resource types can't silently corrupt a mapped row and isn't worth gating on here.",
+  "resource_types": {
+    "prediction": {
+      "found_in": "data",
+      "required_top_level_fields": ["id", "type", "attributes", "relationships"],
+      "attributes": {
+        "direction_id": {
+          "type": "int",
+          "required": true,
+          "nullable": false,
+          "allowed_values": [0, 1],
+          "semantics": "Read directly onto the row's direction_id (NOT NULL in stop_events; a row failing this clause is dropped by pulse.poll._prefilter before insert, but a MISSING or wrong-typed direction_id attribute is a contract violation regardless -- it means the field itself changed shape)."
+        },
+        "arrival_time": {
+          "type": "string_datetime",
+          "required": false,
+          "nullable": true,
+          "semantics": "predicted_arrival. Null at an origin/terminus stop (MBTA gives departure_time only there) -- expected and NOT a violation on its own. A prediction with both arrival_time and departure_time null is skipped by map_rows entirely (schedule_relationship=CANCELLED), also not a violation."
+        },
+        "departure_time": {
+          "type": "string_datetime",
+          "required": false,
+          "nullable": true,
+          "semantics": "Used only to decide whether a prediction carries any temporal signal at all (see arrival_time's semantics) -- never itself written to a stop_events column."
+        },
+        "status": {
+          "type": "string",
+          "required": false,
+          "nullable": true,
+          "semantics": "Read onto the row's status column, which is structurally 100% null in the M1/M2 data -- see docs/lineage.md's status-column note. Nullable here reflects that reality, not a gap in the contract."
+        }
+      },
+      "relationships": {
+        "route": {
+          "required": true,
+          "nullable_data": true,
+          "id_type": "string",
+          "semantics": "route_id. A null relationship produces route_id=None, which pulse.poll._prefilter drops before insert (route_id is NOT NULL) -- not itself a contract violation, since MBTA is not known to ever send this null; the relationship key's presence is what's contractually required."
+        },
+        "stop": {
+          "required": true,
+          "nullable_data": true,
+          "id_type": "string",
+          "semantics": "stop_id. Same nullability posture as route."
+        },
+        "trip": {
+          "required": true,
+          "nullable_data": true,
+          "id_type": "string",
+          "semantics": "trip_id. Same nullability posture as route."
+        },
+        "vehicle": {
+          "required": false,
+          "nullable_data": true,
+          "id_type": "string",
+          "semantics": "vehicle_id. Observed null on real trips (e.g. no vehicle currently assigned) -- nullable is the expected steady state, not a degraded one."
+        },
+        "schedule": {
+          "required": false,
+          "nullable_data": true,
+          "id_type": "string",
+          "semantics": "Joined against `included` (type=schedule) by this id to populate scheduled_arrival. Null on ADDED trips (schedule_relationship=ADDED has no scheduled counterpart) -- expected, not a violation."
+        }
+      }
+    },
+    "schedule": {
+      "found_in": "included",
+      "matched_by": "prediction.relationships.schedule.data.id == schedule.id",
+      "required_top_level_fields": ["id", "type", "attributes"],
+      "attributes": {
+        "arrival_time": {
+          "type": "string_datetime",
+          "required": false,
+          "nullable": true,
+          "semantics": "scheduled_arrival. Null at an origin/terminus stop (schedule carries departure_time only there) -- expected, not a violation."
+        },
+        "service_date": {
+          "type": "string_date",
+          "required": false,
+          "nullable": true,
+          "semantics": "Overrides map_rows' polled_at-derived fallback service_date when present. As fetched today (include=schedule,vehicle) this field has never been observed on a live payload -- its absence is normal, not a violation; the contract still names it so a future MBTA response that DOES include it (e.g. via include=schedule.service) is validated against the same type/nullability rule rather than silently accepted or silently rejected."
+        }
+      }
+    }
+  }
+}

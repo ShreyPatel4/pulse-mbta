@@ -145,11 +145,12 @@ class _FakeSession:
 
 def test_fetch_predictions_builds_expected_request_without_api_key():
     session = _FakeSession({"data": [], "included": []})
-    result, pages, hit_cap = mbta.fetch_predictions(["1", "15", "22"], session, api_key=None)
+    result, pages, hit_cap, violations = mbta.fetch_predictions(["1", "15", "22"], session, api_key=None)
 
     assert result == {"data": [], "included": []}
     assert pages == 1
     assert hit_cap is False
+    assert violations == []
     assert len(session.calls) == 1
     call = session.calls[0]
     assert call["url"] == "https://api-v3.mbta.com/predictions"
@@ -185,8 +186,9 @@ def test_fetch_predictions_follows_links_next_and_merges_pages():
     # observed real-world case (5-route batch, page[limit]=1000, 1667 rows ->
     # 2 pages) that silently truncated data before this fix.
     session = _FakeMultiPageSession([PAGE1, PAGE2])
-    result, pages, hit_cap = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+    result, pages, hit_cap, violations = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
 
+    assert violations == []  # both pages are real, contract-valid fixtures
     assert len(result["data"]) == len(PAGE1["data"]) + len(PAGE2["data"]) == 8
     assert len(result["included"]) == len(PAGE1["included"]) + len(PAGE2["included"]) == 7
     # Order preserved, page 1 first.
@@ -209,7 +211,7 @@ def test_fetch_predictions_merged_payload_maps_the_same_as_the_unpaginated_fixtu
     # The merged 2-page payload should be indistinguishable from a single-page
     # response to map_rows -- same 6 non-skipped rows as the original fixture.
     session = _FakeMultiPageSession([PAGE1, PAGE2])
-    merged, _pages, _hit_cap = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+    merged, _pages, _hit_cap, _violations = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
 
     polled_at = dt.datetime(2026, 8, 13, 2, 30, tzinfo=dt.timezone.utc)
     assert mbta.map_rows(merged, polled_at) == mbta.map_rows(FIXTURE, polled_at)
@@ -218,10 +220,37 @@ def test_fetch_predictions_merged_payload_maps_the_same_as_the_unpaginated_fixtu
 def test_fetch_predictions_stops_when_links_next_is_absent():
     # A single-page response (no links.next) should not trigger a second GET.
     session = _FakeMultiPageSession([{"data": [], "included": [], "links": {}}])
-    _result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None)
+    _result, pages, hit_cap, _violations = mbta.fetch_predictions(["1"], session, api_key=None)
     assert len(session.calls) == 1
     assert pages == 1
     assert hit_cap is False
+
+
+def test_fetch_predictions_drops_only_the_violating_page_and_keeps_the_rest(capsys):
+    # PAGE2's first prediction gets a mutated, contract-violating
+    # direction_id -- PAGE1 (5 real, valid predictions) must still be used,
+    # PAGE2's 3 must be dropped entirely, and the violation must name the
+    # page and the clause.
+    import copy
+
+    bad_page2 = copy.deepcopy(PAGE2)
+    bad_page2["data"][0]["attributes"]["direction_id"] = None
+
+    session = _FakeMultiPageSession([PAGE1, bad_page2])
+    result, pages, hit_cap, violations = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+
+    assert len(result["data"]) == len(PAGE1["data"])  # PAGE2's 3 rows dropped
+    assert result["data"] == PAGE1["data"]
+    assert pages == 2  # both pages were still fetched -- pagination wasn't aborted
+    assert hit_cap is False
+    assert len(violations) == 1
+    assert "page 2" in violations[0]
+    assert "direction_id" in violations[0]
+    assert "non-nullable" in violations[0]
+
+    captured = capsys.readouterr()
+    assert "contract violation" in captured.err
+    assert "page 2" in captured.err
 
 
 class _FakeInfiniteSession:
@@ -239,12 +268,28 @@ class _FakeInfiniteSession:
 
 def test_fetch_predictions_caps_at_5_pages_and_warns_on_stderr(capsys):
     payload = {
-        "data": [{"id": "x", "type": "prediction"}],
+        # A contract-valid minimal prediction -- this test exercises the
+        # pagination cap, not contract validation, so the fixture must pass
+        # contract.validate_page cleanly or every page would get dropped as
+        # a violation before the cap logic is even reached.
+        "data": [
+            {
+                "id": "x",
+                "type": "prediction",
+                "attributes": {"direction_id": 0},
+                "relationships": {
+                    "route": {"data": {"id": "1"}},
+                    "stop": {"data": {"id": "110"}},
+                    "trip": {"data": {"id": "trip-1"}},
+                },
+            }
+        ],
         "included": [],
         "links": {"next": "https://api-v3.mbta.com/predictions?page[offset]=999"},
     }
     session = _FakeInfiniteSession(payload)
-    result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None)
+    result, pages, hit_cap, violations = mbta.fetch_predictions(["1"], session, api_key=None)
+    assert violations == []
 
     assert len(session.calls) == mbta.MAX_PAGES_PER_BATCH == 5
     assert len(result["data"]) == 5  # one row merged per page fetched
@@ -297,7 +342,7 @@ def test_fetch_predictions_retries_on_429_honoring_retry_after_header():
         [_RetryableResponse(429, headers={"Retry-After": "2"}), _RetryableResponse(200, payload=ok_payload)]
     )
     sleeps: list[float] = []
-    result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+    result, pages, hit_cap, violations = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
 
     assert result == {"data": [], "included": []}
     assert pages == 1
@@ -310,7 +355,7 @@ def test_fetch_predictions_retries_on_5xx_with_default_backoff_when_no_header():
     ok_payload = {"data": [], "included": [], "links": {}}
     session = _ScriptedSession([_RetryableResponse(503), _RetryableResponse(200, payload=ok_payload)])
     sleeps: list[float] = []
-    result, _pages, _hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+    result, _pages, _hit_cap, _violations = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
 
     assert result == {"data": [], "included": []}
     assert sleeps == [mbta.DEFAULT_BACKOFF_SECONDS]
@@ -333,7 +378,7 @@ def test_fetch_predictions_retries_on_timeout_then_succeeds():
         [requests.exceptions.Timeout("read timed out (fabricated)"), _RetryableResponse(200, payload=ok_payload)]
     )
     sleeps: list[float] = []
-    result, _pages, _hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+    result, _pages, _hit_cap, _violations = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
 
     assert result == {"data": [], "included": []}
     assert sleeps == [mbta.DEFAULT_BACKOFF_SECONDS]

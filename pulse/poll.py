@@ -162,11 +162,19 @@ def run_cycle(
             break
 
         try:
-            payload, pages, hit_page_cap = mbta.fetch_predictions(batch, session, api_key=api_key, sleep=sleep)
+            payload, pages, hit_page_cap, contract_violations = mbta.fetch_predictions(
+                batch, session, api_key=api_key, sleep=sleep
+            )
             pages_fetched += pages
             if hit_page_cap:
                 cap_message = f"batch {batch} hit {mbta.MAX_PAGES_PER_BATCH}-page cap; data truncated"
                 errors.append(cap_message)
+            for violation in contract_violations:
+                # M2 must-address item 4: fail loud in the ledger, naming the
+                # violated clause -- never silently. The offending page's
+                # data was already dropped inside fetch_predictions; this
+                # batch's other, valid pages still land below.
+                errors.append(f"batch {batch} contract violation: {violation}")
             rows = mbta.map_rows(payload, polled_at)
             valid_rows, skipped = _prefilter(rows)
             with conn.transaction():

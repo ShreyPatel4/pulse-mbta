@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from pulse import contract
+
 PREDICTIONS_URL = "https://api-v3.mbta.com/predictions"
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -106,7 +108,8 @@ def fetch_predictions(
     session: requests.Session,
     api_key: str | None = None,
     sleep: Callable[[float], None] = time.sleep,
-) -> tuple[dict, int, bool]:
+    contract_spec: Mapping[str, Any] | None = None,
+) -> tuple[dict, int, bool, list[str]]:
     """GET /predictions for the given routes, with included schedule + vehicle.
 
     Follows the JSON:API `links.next` URL until it's absent (page exhausted),
@@ -123,14 +126,30 @@ def fetch_predictions(
     MAX_HONORED_RETRY_AFTER_SECONDS) else backing off DEFAULT_BACKOFF_SECONDS.
     `sleep` is injectable so tests don't pay real wall-clock backoff time.
 
-    Returns (merged_payload, pages_fetched, hit_page_cap). pages_fetched is
-    the number of GETs actually completed (1 when links.next is absent on the
-    first page, up to MAX_PAGES_PER_BATCH when the cap is hit) -- pulse.poll
-    sums this across a cycle's batches into poll_runs.pages_fetched.
-    hit_page_cap is True exactly when MAX_PAGES_PER_BATCH was reached with
-    links.next still present (data was truncated) -- pulse.poll surfaces this
-    as an explicit poll_runs.error entry rather than only the stderr line, so
-    a cap hit doesn't silently understate routes_ok coverage in the ledger.
+    Each raw page (one HTTP response's parsed JSON, before it's merged into
+    the running total) is validated against
+    contracts/mbta-predictions.v1.json via pulse.contract.validate_page --
+    M2 must-address item 4. A page with any violation is NOT merged into the
+    returned payload (its data is dropped entirely, page granularity, not
+    row granularity), but pagination still continues to the next page if
+    links.next is present: the envelope fields (`links`) are a separate
+    concern from the resource-shape violations this contract checks, so a
+    malformed `data[3].attributes.direction_id` on page 2 shouldn't stop
+    page 3 (or page 1's already-validated data) from being used. Every
+    violation message found across every page is collected and returned --
+    pulse.poll folds them into that batch's poll_runs error, naming the
+    violated clause rather than surfacing only as a silently rising
+    skipped/null count.
+
+    Returns (merged_payload, pages_fetched, hit_page_cap,
+    contract_violations). pages_fetched is the number of GETs actually
+    completed (1 when links.next is absent on the first page, up to
+    MAX_PAGES_PER_BATCH when the cap is hit) -- pulse.poll sums this across a
+    cycle's batches into poll_runs.pages_fetched. hit_page_cap is True
+    exactly when MAX_PAGES_PER_BATCH was reached with links.next still
+    present (data was truncated) -- pulse.poll surfaces this as an explicit
+    poll_runs.error entry rather than only the stderr line, so a cap hit
+    doesn't silently understate routes_ok coverage in the ledger.
     If a request partway through pagination raises after exhausting retries
     (network error, non-2xx status), the exception propagates before any
     count is returned, so a batch that fails mid-pagination contributes 0 to
@@ -161,16 +180,32 @@ def fetch_predictions(
     }
     headers = {"x-api-key": api_key} if api_key else {}
 
+    # Loaded once per call (not once per page) -- the contract file is tiny
+    # and doesn't change mid-fetch, so re-reading it for every page in a
+    # pagination chain would be pure overhead.
+    loaded_contract = contract_spec if contract_spec is not None else contract.load_contract()
+
     all_data: list[Any] = []
     all_included: list[Any] = []
     url = PREDICTIONS_URL
     hit_page_cap = False
+    contract_violations: list[str] = []
 
     for page in range(1, MAX_PAGES_PER_BATCH + 1):
         resp = _get_with_retry(session, url, params, headers, timeout=20, sleep=sleep)
         payload = resp.json()
-        all_data.extend(payload.get("data") or [])
-        all_included.extend(payload.get("included") or [])
+
+        page_violations = contract.validate_page(payload, loaded_contract)
+        if page_violations:
+            contract_violations.extend(f"page {page}: {v}" for v in page_violations)
+            print(
+                f"pulse.mbta: contract violation on page {page} fetching routes "
+                f"{list(route_ids)}: {'; '.join(page_violations)}",
+                file=sys.stderr,
+            )
+        else:
+            all_data.extend(payload.get("data") or [])
+            all_included.extend(payload.get("included") or [])
 
         next_url = (payload.get("links") or {}).get("next")
         if not next_url:
@@ -189,7 +224,7 @@ def fetch_predictions(
         url = next_url
         params = None
 
-    return {"data": all_data, "included": all_included}, page, hit_page_cap
+    return {"data": all_data, "included": all_included}, page, hit_page_cap, contract_violations
 
 
 def map_rows(payload: Mapping[str, Any], polled_at: dt.datetime) -> list[dict]:

@@ -257,6 +257,55 @@ def test_run_cycle_records_page_cap_hit_as_error_but_batch_still_counts_ok(monke
     assert result.error_text.count("page cap") == 3  # one explicit error per batch
 
 
+class _ContractViolatingSession:
+    """Every batch's single page has a prediction missing its required
+    direction_id attribute -- models a live MBTA schema change surfacing as
+    a contract violation, not a fetch/network failure."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "id": "x",
+                            "type": "prediction",
+                            "attributes": {},  # direction_id missing entirely
+                            "relationships": {
+                                "route": {"data": {"id": "1"}},
+                                "stop": {"data": {"id": "110"}},
+                                "trip": {"data": {"id": "trip-1"}},
+                            },
+                        }
+                    ],
+                    "included": [],
+                }
+
+        return _Resp()
+
+
+def test_run_cycle_records_contract_violation_as_a_named_error_but_batch_still_counts_ok(monkeypatch):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_ContractViolatingSession(),
+        api_key=None,
+        ensure_partitions_fn=lambda _conn: [],
+    )
+
+    assert result.batches_ok == 3  # fetch itself succeeded -- a bad row, not a failed batch
+    assert result.error_text is not None
+    assert result.error_text.count("contract violation") == 3  # one per batch
+    assert "direction_id" in result.error_text
+    # The violating page's data was dropped inside fetch_predictions before
+    # map_rows ever saw it, so nothing from it landed as a row.
+    assert result.rows == 0
+
+
 def test_run_cycle_calls_ensure_partitions_fn_exactly_once_with_the_conn(monkeypatch):
     monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
     sentinel_conn = object()
