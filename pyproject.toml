@@ -7,6 +7,10 @@ requires-python = ">=3.13"
 dependencies = [
     "requests>=2.32",
     "psycopg[binary]>=3.2",
+    "scikit-learn>=1.5",
+    "mlflow>=2.16",
+    "joblib>=1.4",
+    "pandas>=2.2",
 ]
 
 [dependency-groups]
