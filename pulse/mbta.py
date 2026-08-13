@@ -30,7 +30,7 @@ def fetch_predictions(
     route_ids: Sequence[str],
     session: requests.Session,
     api_key: str | None = None,
-) -> dict:
+) -> tuple[dict, int]:
     """GET /predictions for the given routes, with included schedule + vehicle.
 
     Follows the JSON:API `links.next` URL until it's absent (page exhausted),
@@ -41,6 +41,16 @@ def fetch_predictions(
     is not a safe assumption. Capped at MAX_PAGES_PER_BATCH pages; hitting the
     cap logs a warning to stderr and returns what was gathered so far rather
     than looping unbounded.
+
+    Returns (merged_payload, pages_fetched). pages_fetched is the number of
+    GETs actually completed (1 when links.next is absent on the first page,
+    up to MAX_PAGES_PER_BATCH when the cap is hit) -- pulse.poll sums this
+    across a cycle's batches into poll_runs.pages_fetched. If a request
+    partway through pagination raises (network error, non-2xx status), the
+    exception propagates before any count is returned, so a batch that fails
+    mid-pagination contributes 0 to that cycle's pages_fetched even though it
+    may have completed one or more GETs -- by design, not a bug: the caller
+    already logs and counts that batch as failed.
 
     Caveat, confirmed empirically (2026-08-13 live smoke): `/predictions` is a
     live, mutating collection, and this is offset pagination (`page[offset]`),
@@ -92,7 +102,7 @@ def fetch_predictions(
         url = next_url
         params = None
 
-    return {"data": all_data, "included": all_included}
+    return {"data": all_data, "included": all_included}, page
 
 
 def map_rows(payload: Mapping[str, Any], polled_at: dt.datetime) -> list[dict]:
