@@ -13,11 +13,11 @@ import requests
 PREDICTIONS_URL = "https://api-v3.mbta.com/predictions"
 _EASTERN = ZoneInfo("America/New_York")
 
-# Runaway guard for fetch_predictions' pagination follow. 5 high-frequency
-# routes alone were observed returning 1660 predictions (page[limit]=1000 ->
-# 2 pages); this caps how many GETs one batch can spend chasing links.next
-# before giving up and logging what got cut off, rather than looping forever
-# against a pathological response.
+# Runaway guard for fetch_predictions' pagination follow. Observed 2026-08-12
+# (Task 2 live smoke): a single 5-route batch (1,15,22,23,28) returned 1667
+# predictions against page[limit]=1000 -- 2 pages. This caps how many GETs
+# one batch can spend chasing links.next before giving up and logging what
+# got cut off, rather than looping forever against a pathological response.
 MAX_PAGES_PER_BATCH = 5
 
 # The five stop_events columns that are NOT NULL per migrations/001_stop_events.sql.
@@ -41,6 +41,19 @@ def fetch_predictions(
     is not a safe assumption. Capped at MAX_PAGES_PER_BATCH pages; hitting the
     cap logs a warning to stderr and returns what was gathered so far rather
     than looping unbounded.
+
+    Caveat, confirmed empirically (2026-08-13 live smoke): `/predictions` is a
+    live, mutating collection, and this is offset pagination (`page[offset]`),
+    not a cursor over a fixed snapshot. When the underlying set changes
+    between the page-N and page-N+1 requests, items near the offset boundary
+    can shift across it -- observed as ~5 predictions appearing at the tail of
+    page 1 (offsets ~994-998) and again at the head of page 2 (offsets 1-5) in
+    one real fetch. Downstream this is harmless (`stop_events`'s unique key
+    absorbs the duplicate as an `ON CONFLICT DO NOTHING`), but the symmetric
+    failure mode -- an item shifting past a boundary and being skipped by
+    both pages -- is possible in principle and not distinguishable from the
+    DB after the fact. Per-cycle completeness is a strong improvement over
+    the unpaginated version but not a guaranteed-exact snapshot.
 
     Anonymous MBTA V3 access is fine at this volume; when api_key is set,
     it's sent as the x-api-key header (raises the rate limit).
