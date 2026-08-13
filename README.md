@@ -92,24 +92,25 @@ guarantee of an exact per-cycle snapshot.
 
 ## First data
 
-`scripts/check.py` output after the launchd agent had been running for its
-first stretch (2026-08-12 21:45pm-22:06pm ET). This window includes two
-pre-launchd manual smoke cycles (Task 2's 2,704-row baseline runs) plus one
-cycle that returned zero rows (`routes_ok=0/13`) after a self-inflicted
-MBTA rate-limit hit during this task's own diagnostic probing -- see
-`.superpowers/sdd/2026-08-13-m1-ingestion-plan/task-3-report.md` for the
-full per-cycle breakdown and verification trail:
+`scripts/check.py` output after the launchd agent had been driving
+ingestion for a first stretch (launchd's own cycles span 2026-08-12
+21:59:16 -> 22:10:22 ET, about 11 minutes real elapsed). `min_polled_at`
+below predates that: this database also holds two pre-launchd manual
+smoke cycles from Task 2 (the 2,704-row baseline) plus one cycle that
+returned zero rows (`routes_ok=0/13`) after a self-inflicted MBTA
+rate-limit hit during this task's own diagnostic probing -- both are
+counted in `total_rows` but neither is launchd's doing:
 
 ```
-total_rows             = 38369
-last_hour_rows         = 38369
-distinct_trips         = 215
+total_rows             = 50913
+last_hour_rows         = 50913
+distinct_trips         = 223
 distinct_routes        = 13
 distinct_stops         = 630
 min_polled_at          = 2026-08-12 21:45:01.657904-04:00
-max_polled_at          = 2026-08-12 22:06:57.267065-04:00
-scheduled_arrival_null = 1167 (3.04%)
-predicted_arrival_null = 1167 (3.04%)
+max_polled_at          = 2026-08-12 22:10:22.269600-04:00
+scheduled_arrival_null = 1522 (2.99%)
+predicted_arrival_null = 1522 (2.99%)
 ```
 
 ## Out of scope for this repo
