@@ -79,6 +79,16 @@ SETTLE_MARGIN_SECONDS = SETTLE_MARGIN_CYCLES * EXPECTED_CYCLE_SECONDS
 # P(arrival delay > 180s).
 LATE_THRESHOLD_SECONDS = 180
 
+# Sentinel for an unbounded "since" (all of history is eligible). NOT
+# datetime.min: Postgres/psycopg round-trips a year-1 timestamptz through
+# America/New_York's pre-1883 Local Mean Time zone rule (a real, if obscure,
+# tzdata behavior), producing a value psycopg's loader rejects outright
+# ("timestamp too small") if it's ever read back, and the raw offset is
+# genuinely confusing to log/debug. A boring, safely-after-year-1 epoch
+# avoids all of that while still comfortably predating this project's first
+# real data (2026-08-12).
+_NO_LOWER_BOUND = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+
 
 def service_date_norm(instant: dt.datetime) -> dt.date:
     """GTFS 3AM rule. `instant` must be timezone-aware (any zone -- this
@@ -307,7 +317,7 @@ def fetch_touched_groups(
     each aggregated over its FULL stop_events history (see _TOUCHED_GROUPS_SQL's
     comment). since=None means no lower bound (all of history is eligible to
     be "touched")."""
-    since_value = since or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    since_value = since or _NO_LOWER_BOUND
     with conn.cursor() as cur:
         cur.execute(_TOUCHED_GROUPS_SQL, {"since": since_value, "until": until})
         columns = [c.name for c in cur.description]
