@@ -90,8 +90,11 @@ def test_run_cycle_all_batches_failing_zeroes_counts_and_collects_errors(monkeyp
     # conn is never touched on this path: run_cycle only reaches
     # conn.transaction() after a successful fetch + map, and every fetch
     # raises here -- so a real psycopg.Connection isn't needed to exercise
-    # this failure path.
-    result = poll.run_cycle(conn=None, session=session, api_key=None)  # type: ignore[arg-type]
+    # this failure path. ensure_partitions_fn is stubbed to a no-op for the
+    # same reason (conn=None can't back a real pulse.partitions call).
+    result = poll.run_cycle(
+        conn=None, session=session, api_key=None, ensure_partitions_fn=lambda _conn: []
+    )  # type: ignore[arg-type]
 
     assert result.batches_total == 3
     assert result.batches_ok == 0
@@ -128,7 +131,12 @@ def test_run_cycle_success_has_no_error_text(monkeypatch):
 
             return contextlib.nullcontext()
 
-    result = poll.run_cycle(conn=_NoopTransactionConn(), session=_EmptySession(), api_key=None)  # type: ignore[arg-type]
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_EmptySession(),
+        api_key=None,
+        ensure_partitions_fn=lambda _conn: [],
+    )
 
     assert result.batches_ok == 3
     assert result.batches_total == 3
@@ -190,6 +198,7 @@ def test_run_cycle_aborts_cleanly_when_deadline_exceeded_before_a_batch(monkeypa
         api_key=None,
         deadline_seconds=240.0,
         monotonic=lambda: next(clock),
+        ensure_partitions_fn=lambda _conn: [],
     )
 
     assert result.batches_ok == 1  # only batch 0 ran before the deadline hit
@@ -209,6 +218,7 @@ def test_run_cycle_deadline_not_exceeded_runs_all_batches(monkeypatch):
         api_key=None,
         deadline_seconds=240.0,
         monotonic=lambda: 0.0,  # clock never advances -- deadline is never hit
+        ensure_partitions_fn=lambda _conn: [],
     )
 
     assert result.batches_ok == 3
@@ -234,9 +244,60 @@ class _PageCapSession:
 def test_run_cycle_records_page_cap_hit_as_error_but_batch_still_counts_ok(monkeypatch):
     monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
 
-    result = poll.run_cycle(conn=_NoopTransactionConn(), session=_PageCapSession(), api_key=None)  # type: ignore[arg-type]
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_PageCapSession(),
+        api_key=None,
+        ensure_partitions_fn=lambda _conn: [],
+    )
 
     assert result.batches_ok == 3  # a cap hit doesn't fail the batch
     assert result.pages_fetched == 15  # MAX_PAGES_PER_BATCH (5) * 3 batches
     assert result.error_text is not None
     assert result.error_text.count("page cap") == 3  # one explicit error per batch
+
+
+def test_run_cycle_calls_ensure_partitions_fn_exactly_once_with_the_conn(monkeypatch):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+    sentinel_conn = object()
+    calls = []
+
+    def fake_ensure_partitions(conn):
+        calls.append(conn)
+        return []
+
+    poll.run_cycle(
+        conn=sentinel_conn,  # type: ignore[arg-type]
+        session=_EmptyPageSession(),  # type: ignore[arg-type]
+        api_key=None,
+        sleep=lambda *_a, **_kw: None,
+        ensure_partitions_fn=fake_ensure_partitions,
+    )
+
+    assert calls == [sentinel_conn]
+
+
+def test_run_cycle_folds_ensure_partitions_failure_into_errors_but_batches_still_run(monkeypatch, capsys):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+
+    def failing_ensure_partitions(_conn):
+        raise RuntimeError("lock_timeout exceeded (fabricated for this test)")
+
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_EmptyPageSession(),  # type: ignore[arg-type]
+        api_key=None,
+        sleep=lambda *_a, **_kw: None,
+        ensure_partitions_fn=failing_ensure_partitions,
+    )
+
+    # The partition-maintenance failure doesn't skip ingestion: every batch
+    # still ran (stop_events_default is the backstop for an unprovisioned
+    # month, not a reason to stop polling).
+    assert result.batches_ok == 3
+    assert result.error_text is not None
+    assert "ensure_partitions failed" in result.error_text
+    assert "lock_timeout exceeded (fabricated for this test)" in result.error_text
+
+    captured = capsys.readouterr()
+    assert "ensure_partitions failed" in captured.err

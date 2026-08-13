@@ -23,6 +23,7 @@ import psycopg
 import requests
 
 from pulse import db, mbta
+from pulse.partitions import ensure_partitions
 
 ROUTE_IDS = ["1", "15", "22", "23", "28", "32", "39", "57", "66", "71", "73", "77", "111"]
 BATCH_SIZES = (5, 5, 3)
@@ -107,6 +108,7 @@ def run_cycle(
     deadline_seconds: float = CYCLE_DEADLINE_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    ensure_partitions_fn: Callable[[psycopg.Connection], list[str]] = ensure_partitions,
 ) -> CycleResult:
     """Run one poll cycle across all routes in 5/5/3 batches. Never raises:
     a batch failure is caught, logged to stderr, and folded into the
@@ -119,8 +121,8 @@ def run_cycle(
     into `errors` so the ledger row this cycle produces is never silently
     "successful but incomplete" -- error is non-None whenever coverage is
     less than a full cycle would have gotten, for whatever reason.
-    `monotonic`/`sleep` are injectable so this is testable without a real
-    240s wait.
+    `monotonic`/`sleep`/`ensure_partitions_fn` are injectable so this is
+    testable without a real 240s wait or a live Postgres partition check.
     """
     polled_at = dt.datetime.now(dt.timezone.utc)
     batches = mbta.batched(ROUTE_IDS, BATCH_SIZES)
@@ -133,6 +135,20 @@ def run_cycle(
     batches_ok = 0
     pages_fetched = 0
     errors: list[str] = []
+
+    # M2 must-address item 2: keep the rolling partition lookahead current.
+    # Almost always a cheap no-op (see pulse.partitions.ensure_partitions);
+    # caught here rather than left to propagate so a partition-maintenance
+    # failure (e.g. a contended lock) degrades to a recorded ledger error,
+    # not a skipped ingestion cycle -- the batches below still run even if
+    # this fails, and stop_events_default is the backstop if a row's month
+    # genuinely isn't provisioned yet.
+    try:
+        ensure_partitions_fn(conn)
+    except Exception as exc:  # noqa: BLE001 - logged and folded into the ledger, cycle continues
+        message = f"ensure_partitions failed: {exc}"
+        print(f"pulse.poll: {message}", file=sys.stderr)
+        errors.append(message)
 
     for i, batch in enumerate(batches):
         elapsed = monotonic() - cycle_start

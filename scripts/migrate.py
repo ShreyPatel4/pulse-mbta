@@ -63,7 +63,16 @@ def apply_migrations(dsn: str) -> list[str]:
             if path.name in already:
                 continue
             conn.execute(path.read_text())
-            conn.execute("INSERT INTO schema_migrations (name) VALUES (%s)", (path.name,))
+            # ON CONFLICT DO NOTHING: some migrations (e.g. 004, a live
+            # multi-transaction table swap) record themselves into
+            # schema_migrations atomically with their own critical section,
+            # so this follow-up insert is a redundant confirmation for most
+            # migrations and a harmless no-op for that kind -- not a second
+            # source of truth that could itself crash the run on a duplicate
+            # key error.
+            conn.execute(
+                "INSERT INTO schema_migrations (name) VALUES (%s) ON CONFLICT DO NOTHING", (path.name,)
+            )
             applied.append(path.name)
     return applied
 
