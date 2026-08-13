@@ -20,3 +20,21 @@ One entry per scripts/train.py run. Metrics are Task A (P(arrival delay > 180s))
 | logistic_regression | 0.9245 | 0.8670 |
 | gradient_boosting | 0.9204 | 0.8349 |
 
+## v20260813-051522
+
+**PRELIMINARY - insufficient data for the report deliverable** (window is 0.16 days, need >= 7). route_hour_historical_late_rate is drawn from a window nearly identical to the one it's scoring against this early -- treat a high PR-AUC as evidence of that leakage-adjacency, not of model skill.
+
+- git sha: `cf86a58138951e0d18f4277bf6ecfa191d7d82e3`
+- data window: 2026-08-12 21:17:00-04:00 to 2026-08-13 01:13:00-04:00 (0.16 days)
+- train/test rows: 7037 / 3017 (temporal split, 70% train)
+- best real model: `logistic_regression`, saved to `v20260813-051522-logistic_regression.joblib` (gitignored binary)
+- features: route_hour_historical_late_rate, headway_seconds, hour_of_day, day_of_week, current_delay_persistence_seconds
+
+| candidate | pr_auc | recall@precision>=0.80 |
+|---|---|---|
+| baseline_always_on_time | 0.2343 | n/a (never reaches target precision) |
+| baseline_route_hour_rate | 0.5852 | 0.2645 |
+| baseline_persistence | 0.8303 | 0.8444 |
+| logistic_regression | 0.9570 | 0.9066 |
+| gradient_boosting | 0.9366 | 0.8642 |
+
