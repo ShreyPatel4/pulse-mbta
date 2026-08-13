@@ -1,0 +1,22 @@
+[project]
+name = "pulse-mbta"
+version = "0.1.0"
+description = "MBTA bus-delay ingestion and ML pipeline (riders want to know if their bus will be more than 3 minutes late)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.32",
+    "psycopg[binary]>=3.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pulse"]
