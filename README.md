@@ -25,8 +25,10 @@ $0: local Postgres 16, local training, free MBTA V3 API. Full design:
   keyless, polling-only integration, but it is not ground truth arrival
   time and later milestones should not present it as one.
 - Data: MBTA V3 API, 13 high-frequency bus routes (1, 15, 22, 23, 28, 32,
-  39, 57, 66, 71, 73, 77, 111), both directions, all stops. Snapshots
-  every 60s around the clock.
+  39, 57, 66, 71, 73, 77, 111), both directions, all stops. launchd's
+  StartInterval is configured at 60s, but the batch-fetch work (3 batches,
+  2x1.5s inter-batch sleep, plus request time) pushes the measured cadence
+  to ~66s in practice -- about 1,309 cycles/day, not 1,440.
 
 ## How to run
 
@@ -37,14 +39,18 @@ uv run python scripts/migrate.py
 # 2. One poll cycle by hand (prints a summary line, exits 0)
 uv run python -m pulse.poll
 
-# 3. Install the launchd agent (60s interval, RunAtLoad, logs to
-#    /tmp/pulse-ingest.log). Idempotent -- bootout + re-bootstrap on re-run.
+# 3. Install the launchd agents: the poller (StartInterval 60s configured,
+#    ~66s measured cadence, RunAtLoad, logs to /tmp/pulse-ingest.log) and a
+#    caffeinate agent that keeps the Mac awake on AC power so ingestion
+#    doesn't get gapped by sleep. Idempotent -- bootout + re-bootstrap on
+#    re-run.
 scripts/install-launchd.sh
-launchctl list | grep pulse-ingest   # verify it's loaded
+launchctl list | grep pulse          # verify both are loaded
 tail -f /tmp/pulse-ingest.log        # watch cycles land
 
-# 4. Check ingestion health (totals, distinct trips/routes/stops,
-#    min/max polled_at, null rates)
+# 4. Check ingestion health: totals, distinct trips/routes/stops,
+#    min/max polled_at, null rates -- then four PASS/FAIL M1 quality gates
+#    (disk, freshness, volume, null-rate). Exit code 1 if any gate fails.
 uv run python scripts/check.py
 ```
 
@@ -52,6 +58,28 @@ Optional: set `MBTA_API_KEY` in the environment before running the poller
 or installing the launchd agent to use a free MBTA key instead of
 anonymous access (raises the rate limit; anonymous is fine at this
 volume).
+
+## Ops: staying alive, and gaps when it doesn't
+
+`scripts/install-launchd.sh` installs two agents. `org.coconutlabs.pulse-ingest`
+is the poller. `org.coconutlabs.pulse-caffeinate` runs `caffeinate -s -i`
+with `KeepAlive`, which prevents the Mac from sleeping while ingestion needs
+to run -- but `-s` only holds off sleep on AC power; on battery the machine
+can still sleep, and ingestion stops for however long it's asleep.
+
+That gap is not silently lost. Every poll cycle, success or total failure,
+writes one row to `poll_runs` (`migrations/002_poll_runs.sql`): started_at,
+finished_at, how many batches/pages succeeded, rows/inserted/skipped, and an
+error column for failures. A stretch of missing `stop_events` with no
+matching `poll_runs` row (or a `poll_runs` row with `error` set) means the
+poller didn't run or failed -- not that no buses were arriving.
+
+Backfill for that gap is impossible by nature, not a shortcut being
+deferred: MBTA's `/predictions` feed is realtime-only, with no history
+endpoint, so a missed polling window's data is gone forever. `poll_runs` is
+the honest ledger of exactly where those windows are. M2's label-building
+rule follows from this directly: labels must not close across a recorded
+gap.
 
 ## Data quality note: no-arrival-signal rows
 
