@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -25,12 +26,87 @@ MAX_PAGES_PER_BATCH = 5
 # upsert batch on a NotNullViolation.
 REQUIRED_FIELDS = ("route_id", "direction_id", "stop_id", "trip_id", "service_date")
 
+# M2 must-address item 8: Retry-After-aware backoff. Scoped per HTTP GET (not
+# per batch as a whole) -- a batch can span several GETs via pagination, and
+# retrying each request independently means a transient failure on page 2
+# doesn't force re-fetching an already-succeeded page 1. This is a deliberate
+# reading of "per batch": the retry budget lives inside fetch_predictions, so
+# every GET issued while fetching one batch gets its own up-to-2-retries
+# allowance, still bounded by the same MAX_PAGES_PER_BATCH page cap.
+MAX_RETRIES_PER_REQUEST = 2  # up to 3 total attempts per GET
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+DEFAULT_BACKOFF_SECONDS = 5.0
+# Retry-After is honored but clamped: an API returning `Retry-After: 3600`
+# must not be allowed to make the backoff itself blow the poll cycle's 240s
+# deadline (pulse.poll.CYCLE_DEADLINE_SECONDS). 30s keeps 2 retries within a
+# single batch's realistic budget (2 * 30s = 60s worst case) while still
+# comfortably exceeding the unclamped 5s default for a server that's asking
+# for real breathing room.
+MAX_HONORED_RETRY_AFTER_SECONDS = 30.0
+
+
+def _retry_after_seconds(response: requests.Response) -> float:
+    """Parse Retry-After from a response, clamped to
+    MAX_HONORED_RETRY_AFTER_SECONDS. Falls back to DEFAULT_BACKOFF_SECONDS
+    when the header is absent or not a plain integer-seconds value (the
+    HTTP-date form is legal per RFC 9110 but MBTA has never been observed to
+    send it, so it isn't worth the parsing surface)."""
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return DEFAULT_BACKOFF_SECONDS
+    try:
+        seconds = float(header)
+    except ValueError:
+        return DEFAULT_BACKOFF_SECONDS
+    return max(0.0, min(seconds, MAX_HONORED_RETRY_AFTER_SECONDS))
+
+
+def _get_with_retry(
+    session: requests.Session,
+    url: str,
+    params: Mapping[str, str] | None,
+    headers: Mapping[str, str],
+    timeout: int,
+    sleep: Callable[[float], None],
+) -> requests.Response:
+    """One GET, retried up to MAX_RETRIES_PER_REQUEST times (3 attempts
+    total) on a timeout or a retryable status (429/5xx). Non-retryable
+    statuses (4xx other than 429) raise immediately via raise_for_status --
+    retrying a malformed request would just fail the same way three times."""
+    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES_PER_REQUEST + 1):
+        try:
+            resp = session.get(url, params=params, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            backoff = DEFAULT_BACKOFF_SECONDS
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in RETRYABLE_STATUS_CODES:
+                raise
+            last_exc = exc
+            backoff = _retry_after_seconds(exc.response)
+
+        if attempt < MAX_RETRIES_PER_REQUEST:
+            print(
+                f"pulse.mbta: retryable failure ({last_exc}) on attempt {attempt + 1}/"
+                f"{MAX_RETRIES_PER_REQUEST + 1}, backing off {backoff:.1f}s",
+                file=sys.stderr,
+            )
+            sleep(backoff)
+
+    assert last_exc is not None  # loop always sets it before falling through
+    raise last_exc
+
 
 def fetch_predictions(
     route_ids: Sequence[str],
     session: requests.Session,
     api_key: str | None = None,
-) -> tuple[dict, int]:
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[dict, int, bool]:
     """GET /predictions for the given routes, with included schedule + vehicle.
 
     Follows the JSON:API `links.next` URL until it's absent (page exhausted),
@@ -42,15 +118,25 @@ def fetch_predictions(
     cap logs a warning to stderr and returns what was gathered so far rather
     than looping unbounded.
 
-    Returns (merged_payload, pages_fetched). pages_fetched is the number of
-    GETs actually completed (1 when links.next is absent on the first page,
-    up to MAX_PAGES_PER_BATCH when the cap is hit) -- pulse.poll sums this
-    across a cycle's batches into poll_runs.pages_fetched. If a request
-    partway through pagination raises (network error, non-2xx status), the
-    exception propagates before any count is returned, so a batch that fails
-    mid-pagination contributes 0 to that cycle's pages_fetched even though it
-    may have completed one or more GETs -- by design, not a bug: the caller
-    already logs and counts that batch as failed.
+    Each GET is retried up to MAX_RETRIES_PER_REQUEST times on a timeout or a
+    429/5xx response, honoring Retry-After when present (clamped -- see
+    MAX_HONORED_RETRY_AFTER_SECONDS) else backing off DEFAULT_BACKOFF_SECONDS.
+    `sleep` is injectable so tests don't pay real wall-clock backoff time.
+
+    Returns (merged_payload, pages_fetched, hit_page_cap). pages_fetched is
+    the number of GETs actually completed (1 when links.next is absent on the
+    first page, up to MAX_PAGES_PER_BATCH when the cap is hit) -- pulse.poll
+    sums this across a cycle's batches into poll_runs.pages_fetched.
+    hit_page_cap is True exactly when MAX_PAGES_PER_BATCH was reached with
+    links.next still present (data was truncated) -- pulse.poll surfaces this
+    as an explicit poll_runs.error entry rather than only the stderr line, so
+    a cap hit doesn't silently understate routes_ok coverage in the ledger.
+    If a request partway through pagination raises after exhausting retries
+    (network error, non-2xx status), the exception propagates before any
+    count is returned, so a batch that fails mid-pagination contributes 0 to
+    that cycle's pages_fetched even though it may have completed one or more
+    GETs -- by design, not a bug: the caller already logs and counts that
+    batch as failed.
 
     Caveat, confirmed empirically (2026-08-13 live smoke): `/predictions` is a
     live, mutating collection, and this is offset pagination (`page[offset]`),
@@ -78,10 +164,10 @@ def fetch_predictions(
     all_data: list[Any] = []
     all_included: list[Any] = []
     url = PREDICTIONS_URL
+    hit_page_cap = False
 
     for page in range(1, MAX_PAGES_PER_BATCH + 1):
-        resp = session.get(url, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
+        resp = _get_with_retry(session, url, params, headers, timeout=20, sleep=sleep)
         payload = resp.json()
         all_data.extend(payload.get("data") or [])
         all_included.extend(payload.get("included") or [])
@@ -90,6 +176,7 @@ def fetch_predictions(
         if not next_url:
             break
         if page == MAX_PAGES_PER_BATCH:
+            hit_page_cap = True
             print(
                 f"pulse.mbta: hit {MAX_PAGES_PER_BATCH}-page cap fetching routes "
                 f"{list(route_ids)}; links.next still present, remaining data dropped",
@@ -102,7 +189,7 @@ def fetch_predictions(
         url = next_url
         params = None
 
-    return {"data": all_data, "included": all_included}, page
+    return {"data": all_data, "included": all_included}, page, hit_page_cap
 
 
 def map_rows(payload: Mapping[str, Any], polled_at: dt.datetime) -> list[dict]:

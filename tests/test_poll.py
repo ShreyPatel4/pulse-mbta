@@ -135,3 +135,108 @@ def test_run_cycle_success_has_no_error_text(monkeypatch):
     assert result.pages_fetched == 3  # one page per batch, 3 batches
     assert result.errors == []
     assert result.error_text is None
+
+
+def test_summary_line_includes_pages_fetched():
+    result = poll.CycleResult(
+        polled_at=dt.datetime(2026, 8, 13, 2, 0, tzinfo=dt.timezone.utc),
+        rows=10,
+        inserted=10,
+        skipped=0,
+        routes_ok=13,
+        routes_total=13,
+        batches_ok=3,
+        batches_total=3,
+        pages_fetched=4,
+        errors=[],
+    )
+    assert "pages=4" in result.summary_line
+
+
+class _NoopTransactionConn:
+    def transaction(self):
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
+class _EmptyPageSession:
+    """A single-page, no-data response for every batch -- used where the
+    test only cares about cycle-level control flow (deadline, cap-hit), not
+    row mapping."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [], "included": []}
+
+        return _Resp()
+
+
+def test_run_cycle_aborts_cleanly_when_deadline_exceeded_before_a_batch(monkeypatch):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+
+    # 1st call: cycle_start = 0.0. 2nd call: elapsed check before batch 0 =
+    # 0.0 (proceeds). 3rd call: elapsed check before batch 1 = 999.0 (well
+    # past the 240s deadline) -- models real time passing while batch 0 ran.
+    clock = iter([0.0, 0.0, 999.0])
+
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_EmptyPageSession(),  # type: ignore[arg-type]
+        api_key=None,
+        deadline_seconds=240.0,
+        monotonic=lambda: next(clock),
+    )
+
+    assert result.batches_ok == 1  # only batch 0 ran before the deadline hit
+    assert result.batches_total == 3
+    assert result.routes_ok == 5  # batch 0's route count (BATCH_SIZES = (5, 5, 3))
+    assert result.error_text is not None
+    assert "deadline" in result.error_text
+    assert "240" in result.error_text
+
+
+def test_run_cycle_deadline_not_exceeded_runs_all_batches(monkeypatch):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+
+    result = poll.run_cycle(
+        conn=_NoopTransactionConn(),  # type: ignore[arg-type]
+        session=_EmptyPageSession(),  # type: ignore[arg-type]
+        api_key=None,
+        deadline_seconds=240.0,
+        monotonic=lambda: 0.0,  # clock never advances -- deadline is never hit
+    )
+
+    assert result.batches_ok == 3
+    assert result.error_text is None
+
+
+class _PageCapSession:
+    """Every GET returns a payload whose links.next is always present, so
+    every batch runs the pagination loop out to MAX_PAGES_PER_BATCH and hits
+    the cap -- models a batch whose result set is truncated."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [], "included": [], "links": {"next": "https://api-v3.mbta.com/predictions?page[offset]=1"}}
+
+        return _Resp()
+
+
+def test_run_cycle_records_page_cap_hit_as_error_but_batch_still_counts_ok(monkeypatch):
+    monkeypatch.setattr(poll.time, "sleep", lambda *_a, **_kw: None)
+
+    result = poll.run_cycle(conn=_NoopTransactionConn(), session=_PageCapSession(), api_key=None)  # type: ignore[arg-type]
+
+    assert result.batches_ok == 3  # a cap hit doesn't fail the batch
+    assert result.pages_fetched == 15  # MAX_PAGES_PER_BATCH (5) * 3 batches
+    assert result.error_text is not None
+    assert result.error_text.count("page cap") == 3  # one explicit error per batch

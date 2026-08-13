@@ -17,6 +17,7 @@ import datetime as dt
 import os
 import sys
 import time
+from collections.abc import Callable
 
 import psycopg
 import requests
@@ -28,6 +29,14 @@ BATCH_SIZES = (5, 5, 3)
 BATCH_SLEEP_SECONDS = 1.5
 DB_CONNECT_ATTEMPTS = 3
 DB_CONNECT_RETRY_SECONDS = 2.0
+
+# M2 must-address item 8: cycle deadline. The M1 review flagged a worst-case
+# ~300s hang (retries + pagination stacking up across a bad batch) silently
+# eating a sample window while launchd's next StartInterval fire waits behind
+# it. A monotonic elapsed-time check between batches -- rather than SIGALRM --
+# keeps this a pure, testable function and can't leave a request's socket in
+# a torn state mid-write the way a signal landing inside a syscall could.
+CYCLE_DEADLINE_SECONDS = 240.0
 
 
 def _prefilter(rows: list[dict]) -> tuple[list[dict], int]:
@@ -70,9 +79,15 @@ class CycleResult:
 
     @property
     def summary_line(self) -> str:
+        # pages=N surfaces pagination volume directly in the log line: M1's
+        # review noted routes_ok overstates coverage at the page cap (a route
+        # counts "ok" even if its batch got truncated at MAX_PAGES_PER_BATCH),
+        # so pages sitting well above batches_total is the tell that some
+        # batch is paginating harder than 1 page and worth a closer look.
         return (
             f"polled_at={self.polled_at.isoformat()} rows={self.rows} inserted={self.inserted} "
-            f"routes_ok={self.routes_ok}/{self.routes_total} skipped={self.skipped}"
+            f"routes_ok={self.routes_ok}/{self.routes_total} skipped={self.skipped} "
+            f"pages={self.pages_fetched}"
         )
 
     @property
@@ -85,12 +100,31 @@ class CycleResult:
         return "; ".join(self.errors) if self.errors else None
 
 
-def run_cycle(conn: psycopg.Connection, session: requests.Session, api_key: str | None) -> CycleResult:
+def run_cycle(
+    conn: psycopg.Connection,
+    session: requests.Session,
+    api_key: str | None,
+    deadline_seconds: float = CYCLE_DEADLINE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> CycleResult:
     """Run one poll cycle across all routes in 5/5/3 batches. Never raises:
     a batch failure is caught, logged to stderr, and folded into the
-    returned CycleResult so the caller can still record a poll_runs row."""
+    returned CycleResult so the caller can still record a poll_runs row.
+
+    Checks a monotonic elapsed-time deadline before starting each batch (not
+    mid-batch -- see CYCLE_DEADLINE_SECONDS). If the deadline has already
+    passed, remaining batches are skipped entirely (not attempted, not
+    counted as failed-and-retried) and a deadline-exceeded message is folded
+    into `errors` so the ledger row this cycle produces is never silently
+    "successful but incomplete" -- error is non-None whenever coverage is
+    less than a full cycle would have gotten, for whatever reason.
+    `monotonic`/`sleep` are injectable so this is testable without a real
+    240s wait.
+    """
     polled_at = dt.datetime.now(dt.timezone.utc)
     batches = mbta.batched(ROUTE_IDS, BATCH_SIZES)
+    cycle_start = monotonic()
 
     total_rows = 0
     total_inserted = 0
@@ -101,9 +135,22 @@ def run_cycle(conn: psycopg.Connection, session: requests.Session, api_key: str 
     errors: list[str] = []
 
     for i, batch in enumerate(batches):
+        elapsed = monotonic() - cycle_start
+        if elapsed > deadline_seconds:
+            message = (
+                f"cycle deadline ({deadline_seconds:.0f}s) exceeded after {elapsed:.1f}s; "
+                f"aborting cleanly before batch {i + 1}/{len(batches)} ({batch})"
+            )
+            print(f"pulse.poll: {message}", file=sys.stderr)
+            errors.append(message)
+            break
+
         try:
-            payload, pages = mbta.fetch_predictions(batch, session, api_key=api_key)
+            payload, pages, hit_page_cap = mbta.fetch_predictions(batch, session, api_key=api_key, sleep=sleep)
             pages_fetched += pages
+            if hit_page_cap:
+                cap_message = f"batch {batch} hit {mbta.MAX_PAGES_PER_BATCH}-page cap; data truncated"
+                errors.append(cap_message)
             rows = mbta.map_rows(payload, polled_at)
             valid_rows, skipped = _prefilter(rows)
             with conn.transaction():

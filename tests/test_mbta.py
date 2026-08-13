@@ -9,6 +9,9 @@ import datetime as dt
 import json
 from pathlib import Path
 
+import pytest
+import requests
+
 from pulse import mbta
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -142,10 +145,11 @@ class _FakeSession:
 
 def test_fetch_predictions_builds_expected_request_without_api_key():
     session = _FakeSession({"data": [], "included": []})
-    result, pages = mbta.fetch_predictions(["1", "15", "22"], session, api_key=None)
+    result, pages, hit_cap = mbta.fetch_predictions(["1", "15", "22"], session, api_key=None)
 
     assert result == {"data": [], "included": []}
     assert pages == 1
+    assert hit_cap is False
     assert len(session.calls) == 1
     call = session.calls[0]
     assert call["url"] == "https://api-v3.mbta.com/predictions"
@@ -181,7 +185,7 @@ def test_fetch_predictions_follows_links_next_and_merges_pages():
     # observed real-world case (5-route batch, page[limit]=1000, 1667 rows ->
     # 2 pages) that silently truncated data before this fix.
     session = _FakeMultiPageSession([PAGE1, PAGE2])
-    result, pages = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+    result, pages, hit_cap = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
 
     assert len(result["data"]) == len(PAGE1["data"]) + len(PAGE2["data"]) == 8
     assert len(result["included"]) == len(PAGE1["included"]) + len(PAGE2["included"]) == 7
@@ -190,6 +194,7 @@ def test_fetch_predictions_follows_links_next_and_merges_pages():
     assert result["data"][-1]["id"] == PAGE2["data"][-1]["id"]
 
     assert pages == 2
+    assert hit_cap is False
     assert len(session.calls) == 2
     first, second = session.calls
     assert first["url"] == mbta.PREDICTIONS_URL
@@ -204,7 +209,7 @@ def test_fetch_predictions_merged_payload_maps_the_same_as_the_unpaginated_fixtu
     # The merged 2-page payload should be indistinguishable from a single-page
     # response to map_rows -- same 6 non-skipped rows as the original fixture.
     session = _FakeMultiPageSession([PAGE1, PAGE2])
-    merged, _pages = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+    merged, _pages, _hit_cap = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
 
     polled_at = dt.datetime(2026, 8, 13, 2, 30, tzinfo=dt.timezone.utc)
     assert mbta.map_rows(merged, polled_at) == mbta.map_rows(FIXTURE, polled_at)
@@ -213,9 +218,10 @@ def test_fetch_predictions_merged_payload_maps_the_same_as_the_unpaginated_fixtu
 def test_fetch_predictions_stops_when_links_next_is_absent():
     # A single-page response (no links.next) should not trigger a second GET.
     session = _FakeMultiPageSession([{"data": [], "included": [], "links": {}}])
-    _result, pages = mbta.fetch_predictions(["1"], session, api_key=None)
+    _result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None)
     assert len(session.calls) == 1
     assert pages == 1
+    assert hit_cap is False
 
 
 class _FakeInfiniteSession:
@@ -238,16 +244,121 @@ def test_fetch_predictions_caps_at_5_pages_and_warns_on_stderr(capsys):
         "links": {"next": "https://api-v3.mbta.com/predictions?page[offset]=999"},
     }
     session = _FakeInfiniteSession(payload)
-    result, pages = mbta.fetch_predictions(["1"], session, api_key=None)
+    result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None)
 
     assert len(session.calls) == mbta.MAX_PAGES_PER_BATCH == 5
     assert len(result["data"]) == 5  # one row merged per page fetched
     assert pages == mbta.MAX_PAGES_PER_BATCH == 5
+    assert hit_cap is True
 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "cap" in captured.err.lower()
     assert "['1']" in captured.err
+
+
+class _RetryableResponse:
+    """A response whose raise_for_status() raises HTTPError with the given
+    status/headers attached -- exercises _get_with_retry's 429/5xx path
+    without a real HTTP round-trip."""
+
+    def __init__(self, status_code, headers=None, payload=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error", response=self)
+
+    def json(self):
+        return self._payload
+
+
+class _ScriptedSession:
+    """Returns responses (or raises exceptions) from a scripted list, one per
+    .get() call -- models a request failing N times before succeeding."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(url)
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_fetch_predictions_retries_on_429_honoring_retry_after_header():
+    ok_payload = {"data": [], "included": [], "links": {}}
+    session = _ScriptedSession(
+        [_RetryableResponse(429, headers={"Retry-After": "2"}), _RetryableResponse(200, payload=ok_payload)]
+    )
+    sleeps: list[float] = []
+    result, pages, hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert result == {"data": [], "included": []}
+    assert pages == 1
+    assert hit_cap is False
+    assert len(session.calls) == 2
+    assert sleeps == [2.0]
+
+
+def test_fetch_predictions_retries_on_5xx_with_default_backoff_when_no_header():
+    ok_payload = {"data": [], "included": [], "links": {}}
+    session = _ScriptedSession([_RetryableResponse(503), _RetryableResponse(200, payload=ok_payload)])
+    sleeps: list[float] = []
+    result, _pages, _hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert result == {"data": [], "included": []}
+    assert sleeps == [mbta.DEFAULT_BACKOFF_SECONDS]
+
+
+def test_fetch_predictions_clamps_retry_after_above_max():
+    ok_payload = {"data": [], "included": [], "links": {}}
+    session = _ScriptedSession(
+        [_RetryableResponse(429, headers={"Retry-After": "3600"}), _RetryableResponse(200, payload=ok_payload)]
+    )
+    sleeps: list[float] = []
+    mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert sleeps == [mbta.MAX_HONORED_RETRY_AFTER_SECONDS]
+
+
+def test_fetch_predictions_retries_on_timeout_then_succeeds():
+    ok_payload = {"data": [], "included": [], "links": {}}
+    session = _ScriptedSession(
+        [requests.exceptions.Timeout("read timed out (fabricated)"), _RetryableResponse(200, payload=ok_payload)]
+    )
+    sleeps: list[float] = []
+    result, _pages, _hit_cap = mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert result == {"data": [], "included": []}
+    assert sleeps == [mbta.DEFAULT_BACKOFF_SECONDS]
+
+
+def test_fetch_predictions_gives_up_after_max_retries():
+    session = _ScriptedSession([_RetryableResponse(503), _RetryableResponse(503), _RetryableResponse(503)])
+    sleeps: list[float] = []
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert len(session.calls) == mbta.MAX_RETRIES_PER_REQUEST + 1 == 3
+    assert len(sleeps) == mbta.MAX_RETRIES_PER_REQUEST == 2
+
+
+def test_fetch_predictions_does_not_retry_non_retryable_4xx():
+    session = _ScriptedSession([_RetryableResponse(404)])
+    sleeps: list[float] = []
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        mbta.fetch_predictions(["1"], session, api_key=None, sleep=sleeps.append)
+
+    assert len(session.calls) == 1
+    assert sleeps == []
 
 
 def test_batched_splits_13_routes_into_5_5_3():

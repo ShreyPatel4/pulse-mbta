@@ -3,3 +3,13 @@ __pycache__/
 *.log
 .DS_Store
 data/
+.pytest_cache/
+
+# M2: local-only artifacts. data-backups/ holds pre-migration pg_dumps
+# (operational safety net, not repo content); mlruns/ is MLflow's local file
+# store; models/ holds joblib binaries -- REGISTRY.md (the human-readable
+# ledger) is tracked, the binaries are not.
+data-backups/
+mlruns/
+models/*
+!models/REGISTRY.md

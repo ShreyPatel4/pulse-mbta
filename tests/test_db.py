@@ -12,7 +12,13 @@ from pulse import db
 
 ADMIN_DSN = "postgresql://localhost/postgres"
 TEST_DSN = "postgresql://localhost/pulse_test"
-MIGRATION_SQL = (Path(__file__).resolve().parent.parent / "migrations" / "001_stop_events.sql").read_text()
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+# Every migrations/*.sql in name order, not just 001 -- a fixture pinned to
+# 001 alone drifts the moment a later migration changes the live shape (e.g.
+# 004's partitioning), and tests would keep passing against a schema the
+# poller no longer writes to. sorted() matches scripts/migrate.py's own
+# apply order exactly.
+MIGRATION_PATHS = sorted(MIGRATIONS_DIR.glob("*.sql"))
 
 
 @pytest.fixture()
@@ -22,7 +28,8 @@ def conn():
         admin.execute("CREATE DATABASE pulse_test")
 
     with psycopg.connect(TEST_DSN, autocommit=True) as setup:
-        setup.execute(MIGRATION_SQL)
+        for path in MIGRATION_PATHS:
+            setup.execute(path.read_text())
 
     test_conn = db.connect(TEST_DSN)
     try:
@@ -87,6 +94,29 @@ def test_upsert_batch_mixed_new_and_duplicate(conn):
 def test_upsert_empty_rows_returns_zero_and_no_op(conn):
     assert db.upsert_stop_events(conn, []) == 0
     assert _count(conn) == 0
+
+
+def test_connect_passes_connect_timeout_kwarg(monkeypatch):
+    """Pure test (no real Postgres): db.connect() must pass connect_timeout
+    as a psycopg.connect kwarg, not bake it into DEFAULT_DSN -- kwargs still
+    apply when PULSE_DSN overrides the DSN string entirely."""
+    captured: dict = {}
+
+    class _FakeConn:
+        autocommit = False
+
+    def fake_connect(dsn, **kwargs):
+        captured["dsn"] = dsn
+        captured["kwargs"] = kwargs
+        return _FakeConn()
+
+    monkeypatch.setattr(db.psycopg, "connect", fake_connect)
+
+    conn = db.connect("postgresql://example/db")
+
+    assert captured["dsn"] == "postgresql://example/db"
+    assert captured["kwargs"] == {"connect_timeout": db.CONNECT_TIMEOUT_SECONDS}
+    assert conn.autocommit is True
 
 
 def test_upsert_allows_null_optional_fields(conn):

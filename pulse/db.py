@@ -10,6 +10,16 @@ import psycopg
 
 DEFAULT_DSN = "postgresql://localhost/pulse"
 
+# M2 must-address item 8: connect_timeout in the DSN. Passed as a connect()
+# kwarg rather than baked into DEFAULT_DSN so it still applies when PULSE_DSN
+# overrides the DSN entirely (psycopg merges kwargs into whatever conninfo
+# string it's given, kwargs win over any value the string also sets) --
+# baking it into DEFAULT_DSN would silently stop applying the moment an
+# operator sets PULSE_DSN. Bounds how long a login race (e.g. Postgres still
+# starting up under brew services right after a reboot) can hang before
+# pulse.poll's own retry-with-backoff gets a chance to run.
+CONNECT_TIMEOUT_SECONDS = 10
+
 _UPSERT_SQL = """
 INSERT INTO stop_events (
     route_id, direction_id, stop_id, trip_id, vehicle_id,
@@ -40,7 +50,7 @@ def connect(dsn: str | None = None) -> psycopg.Connection:
     ``pulse`` database over TCP localhost (trust auth).
     """
     dsn = dsn or os.environ.get("PULSE_DSN", DEFAULT_DSN)
-    conn = psycopg.connect(dsn)
+    conn = psycopg.connect(dsn, connect_timeout=CONNECT_TIMEOUT_SECONDS)
     conn.autocommit = True
     return conn
 
