@@ -11,9 +11,10 @@ from pathlib import Path
 
 from pulse import mbta
 
-FIXTURE = json.loads(
-    (Path(__file__).resolve().parent / "fixtures" / "predictions_sample.json").read_text()
-)
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+FIXTURE = json.loads((FIXTURES_DIR / "predictions_sample.json").read_text())
+PAGE1 = json.loads((FIXTURES_DIR / "predictions_sample_page1.json").read_text())
+PAGE2 = json.loads((FIXTURES_DIR / "predictions_sample_page2.json").read_text())
 
 # 2026-08-13T02:30:00Z is 2026-08-12 22:30 in America/New_York (EDT, UTC-4).
 # Deliberately chosen so the UTC calendar date (13th) and the correct NY
@@ -158,6 +159,91 @@ def test_fetch_predictions_sends_x_api_key_header_when_set():
     mbta.fetch_predictions(["1"], session, api_key="secret-key")
 
     assert session.calls[0]["headers"] == {"x-api-key": "secret-key"}
+
+
+class _FakeMultiPageSession:
+    """Returns one payload per call, in order -- models following links.next
+    across successive GETs (real fetch_predictions calls, one per page)."""
+
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+        return _FakeResponse(self._payloads.pop(0))
+
+
+def test_fetch_predictions_follows_links_next_and_merges_pages():
+    # PAGE1/PAGE2 are a real 8-prediction fixture split 5/3 with a
+    # links.next chain -- derived from predictions_sample.json, modeling the
+    # observed real-world case (5-route batch, page[limit]=1000, 1667 rows ->
+    # 2 pages) that silently truncated data before this fix.
+    session = _FakeMultiPageSession([PAGE1, PAGE2])
+    result = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+
+    assert len(result["data"]) == len(PAGE1["data"]) + len(PAGE2["data"]) == 8
+    assert len(result["included"]) == len(PAGE1["included"]) + len(PAGE2["included"]) == 7
+    # Order preserved, page 1 first.
+    assert result["data"][0]["id"] == PAGE1["data"][0]["id"]
+    assert result["data"][-1]["id"] == PAGE2["data"][-1]["id"]
+
+    assert len(session.calls) == 2
+    first, second = session.calls
+    assert first["url"] == mbta.PREDICTIONS_URL
+    assert first["params"]["filter[route]"] == "1,15,22,23,28"
+    # Second GET hits links.next verbatim -- it's already a complete URL
+    # (query string included), so no separate params are sent.
+    assert second["url"] == PAGE1["links"]["next"]
+    assert second["params"] is None
+
+
+def test_fetch_predictions_merged_payload_maps_the_same_as_the_unpaginated_fixture():
+    # The merged 2-page payload should be indistinguishable from a single-page
+    # response to map_rows -- same 6 non-skipped rows as the original fixture.
+    session = _FakeMultiPageSession([PAGE1, PAGE2])
+    merged = mbta.fetch_predictions(["1", "15", "22", "23", "28"], session, api_key=None)
+
+    polled_at = dt.datetime(2026, 8, 13, 2, 30, tzinfo=dt.timezone.utc)
+    assert mbta.map_rows(merged, polled_at) == mbta.map_rows(FIXTURE, polled_at)
+
+
+def test_fetch_predictions_stops_when_links_next_is_absent():
+    # A single-page response (no links.next) should not trigger a second GET.
+    session = _FakeMultiPageSession([{"data": [], "included": [], "links": {}}])
+    mbta.fetch_predictions(["1"], session, api_key=None)
+    assert len(session.calls) == 1
+
+
+class _FakeInfiniteSession:
+    """Always returns a payload whose links.next points at itself -- models a
+    pathological/never-terminating pagination chain."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(url)
+        return _FakeResponse(self._payload)
+
+
+def test_fetch_predictions_caps_at_5_pages_and_warns_on_stderr(capsys):
+    payload = {
+        "data": [{"id": "x", "type": "prediction"}],
+        "included": [],
+        "links": {"next": "https://api-v3.mbta.com/predictions?page[offset]=999"},
+    }
+    session = _FakeInfiniteSession(payload)
+    result = mbta.fetch_predictions(["1"], session, api_key=None)
+
+    assert len(session.calls) == mbta.MAX_PAGES_PER_BATCH == 5
+    assert len(result["data"]) == 5  # one row merged per page fetched
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cap" in captured.err.lower()
+    assert "['1']" in captured.err
 
 
 def test_batched_splits_13_routes_into_5_5_3():

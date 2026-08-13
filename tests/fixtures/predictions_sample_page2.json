@@ -1,0 +1,229 @@
+{
+  "jsonapi": {
+    "version": "1.0"
+  },
+  "links": {
+    "first": "https://api-v3.mbta.com/predictions?filter[route]=1%2C15%2C22%2C23%2C28&include=schedule%2Cvehicle&page[limit]=1000&page[offset]=0",
+    "last": "https://api-v3.mbta.com/predictions?filter[route]=1%2C15%2C22%2C23%2C28&include=schedule%2Cvehicle&page[limit]=1000&page[offset]=1000",
+    "prev": "https://api-v3.mbta.com/predictions?filter[route]=1%2C15%2C22%2C23%2C28&include=schedule%2Cvehicle&page[limit]=1000&page[offset]=0"
+  },
+  "data": [
+    {
+      "attributes": {
+        "arrival_time": "2026-08-12T21:37:30-04:00",
+        "arrival_uncertainty": null,
+        "departure_time": null,
+        "departure_uncertainty": null,
+        "direction_id": 1,
+        "last_trip": false,
+        "revenue": "REVENUE",
+        "schedule_relationship": "ADDED",
+        "status": null,
+        "stop_sequence": 26,
+        "trip_headsign": null,
+        "update_type": null
+      },
+      "id": "prediction-77140530-OL1-23391-26-39",
+      "relationships": {
+        "route": {
+          "data": {
+            "id": "39",
+            "type": "route"
+          }
+        },
+        "schedule": {
+          "data": null
+        },
+        "stop": {
+          "data": {
+            "id": "23391",
+            "type": "stop"
+          }
+        },
+        "trip": {
+          "data": {
+            "id": "77140530-OL1",
+            "type": "trip"
+          }
+        },
+        "vehicle": {
+          "data": {
+            "id": "y1265",
+            "type": "vehicle"
+          }
+        }
+      },
+      "type": "prediction"
+    },
+    {
+      "attributes": {
+        "arrival_time": null,
+        "arrival_uncertainty": null,
+        "departure_time": null,
+        "departure_uncertainty": null,
+        "direction_id": 1,
+        "last_trip": false,
+        "revenue": "REVENUE",
+        "schedule_relationship": "CANCELLED",
+        "status": null,
+        "stop_sequence": 1,
+        "trip_headsign": null,
+        "update_type": null
+      },
+      "id": "prediction-77055343-42819-1-32",
+      "relationships": {
+        "route": {
+          "data": {
+            "id": "32",
+            "type": "route"
+          }
+        },
+        "schedule": {
+          "data": {
+            "id": "schedule-77055343-42819-1",
+            "type": "schedule"
+          }
+        },
+        "stop": {
+          "data": {
+            "id": "42819",
+            "type": "stop"
+          }
+        },
+        "trip": {
+          "data": {
+            "id": "77055343",
+            "type": "trip"
+          }
+        },
+        "vehicle": {
+          "data": null
+        }
+      },
+      "type": "prediction"
+    },
+    {
+      "attributes": {
+        "arrival_time": null,
+        "arrival_uncertainty": null,
+        "departure_time": null,
+        "departure_uncertainty": null,
+        "direction_id": 1,
+        "last_trip": false,
+        "revenue": "REVENUE",
+        "schedule_relationship": "CANCELLED",
+        "status": null,
+        "stop_sequence": 2,
+        "trip_headsign": null,
+        "update_type": null
+      },
+      "id": "prediction-77055343-16466-2-32",
+      "relationships": {
+        "route": {
+          "data": {
+            "id": "32",
+            "type": "route"
+          }
+        },
+        "schedule": {
+          "data": {
+            "id": "schedule-77055343-16466-2",
+            "type": "schedule"
+          }
+        },
+        "stop": {
+          "data": {
+            "id": "16466",
+            "type": "stop"
+          }
+        },
+        "trip": {
+          "data": {
+            "id": "77055343",
+            "type": "trip"
+          }
+        },
+        "vehicle": {
+          "data": null
+        }
+      },
+      "type": "prediction"
+    }
+  ],
+  "included": [
+    {
+      "attributes": {
+        "arrival_time": null,
+        "departure_time": "2026-08-12T22:11:00-04:00",
+        "direction_id": 1,
+        "drop_off_type": 1,
+        "pickup_type": 0,
+        "stop_headsign": null,
+        "stop_sequence": 1,
+        "timepoint": true
+      },
+      "id": "schedule-77055343-42819-1",
+      "relationships": {
+        "added_routes": {
+          "data": []
+        },
+        "route": {
+          "data": {
+            "id": "32",
+            "type": "route"
+          }
+        },
+        "stop": {
+          "data": {
+            "id": "42819",
+            "type": "stop"
+          }
+        },
+        "trip": {
+          "data": {
+            "id": "77055343",
+            "type": "trip"
+          }
+        }
+      },
+      "type": "schedule"
+    },
+    {
+      "attributes": {
+        "arrival_time": "2026-08-12T22:12:00-04:00",
+        "departure_time": "2026-08-12T22:12:00-04:00",
+        "direction_id": 1,
+        "drop_off_type": 0,
+        "pickup_type": 0,
+        "stop_headsign": null,
+        "stop_sequence": 2,
+        "timepoint": false
+      },
+      "id": "schedule-77055343-16466-2",
+      "relationships": {
+        "added_routes": {
+          "data": []
+        },
+        "route": {
+          "data": {
+            "id": "32",
+            "type": "route"
+          }
+        },
+        "stop": {
+          "data": {
+            "id": "16466",
+            "type": "stop"
+          }
+        },
+        "trip": {
+          "data": {
+            "id": "77055343",
+            "type": "trip"
+          }
+        }
+      },
+      "type": "schedule"
+    }
+  ]
+}
