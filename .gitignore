@@ -5,6 +5,10 @@ __pycache__/
 data/
 .pytest_cache/
 
+# wrangler's local cache/session dir (created by `npx wrangler d1 ...`
+# commands run from this repo) -- no repo content, machine-local only.
+.wrangler/
+
 # M2: local-only artifacts. data-backups/ holds pre-migration pg_dumps
 # (operational safety net, not repo content); mlruns/ is MLflow's local file
 # store; models/ holds joblib binaries -- REGISTRY.md (the human-readable
