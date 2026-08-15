@@ -38,17 +38,17 @@ One entry per scripts/train.py run. Metrics are Task A (P(arrival delay > 180s))
 | logistic_regression | 0.9570 | 0.9066 |
 | gradient_boosting | 0.9366 | 0.8642 |
 
-## v20260815-205642
+## v20260815-210641
 
 **PRELIMINARY - insufficient data for the report deliverable** (window is 2.79 days, need >= 7). See docs/report.md for what this window can and cannot support.
 
-- git sha: `bde6ed5606d49e87ab1f950faf755ff3f47c6096` (the code state this run came from, not the commit carrying it)
+- git sha: `1bbc601156698f8ce6482ffae5ac44838a8fa0df` (the commit HEAD pointed at during the run; uncommitted working-tree changes are not reflected)
 - ingestion window: 2026-08-12 21:45:01.657904-04:00 to 2026-08-15 16:07:41.980657-04:00 (2.77 days), 10532354 stop_events rows, 65.0% uptime
 - labels: 185247 closed / 142258 training-usable / 32047 gap_abutted / 10942 no_arrival_signal
 - training window (scheduled_arrival): 2026-08-12 21:17:00-04:00 to 2026-08-15 16:08:00-04:00 (2.79 days)
 - train split: 99590 rows [2026-08-12 21:17:00-04:00 .. 2026-08-15 00:04:00-04:00], late rate 38.69%
 - test split: 42649 rows [2026-08-15 00:05:00-04:00 .. 2026-08-15 16:08:00-04:00], late rate 34.54%
-- best real model: `gradient_boosting`, saved to `v20260815-205642-gradient_boosting.joblib` (gitignored binary)
+- best real model: `gradient_boosting`, saved to `v20260815-210641-gradient_boosting.joblib` (gitignored binary)
 - features: route_hour_historical_late_rate, headway_seconds, hour_of_day, day_of_week, current_delay_persistence_seconds
 
 | candidate | pr_auc | roc_auc | recall@P>=0.80 (oracle) | train threshold | test precision | test recall | test accuracy | tn | fp | fn | tp |

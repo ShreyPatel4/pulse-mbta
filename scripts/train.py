@@ -475,7 +475,10 @@ def _append_registry_entry(
             f"(window is {window_days:.2f} days, need >= {MIN_DAYS_FOR_REPORT}). "
             "See docs/report.md for what this window can and cannot support.\n\n"
         )
-    lines.append(f"- git sha: `{git_sha}` (the code state this run came from, not the commit carrying it)\n")
+    lines.append(
+        f"- git sha: `{git_sha}` (the commit HEAD pointed at during the run; "
+        "uncommitted working-tree changes are not reflected)\n"
+    )
     lines.append(
         f"- ingestion window: {regime['ingest_start']} to {regime['ingest_end']} "
         f"({regime['ingest_days']:.2f} days), {regime['stop_events_rows']} stop_events rows, "

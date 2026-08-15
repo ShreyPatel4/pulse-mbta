@@ -392,6 +392,15 @@ That is a single observation, not a trend. *Settle it:* prequential
 evaluation, fix the threshold from day N and report the precision actually
 realized on day N+1 across a full week.
 
+**The rerun is not bit-for-bit pinned, only snapshot-pinned.** `--until`
+bounds the snapshots considered, but the gap ledger is read unwindowed, so
+rerunning these commands after the laptop sleeps again can reclassify a
+small number of labels near the boundary and shift the counts. This is a
+reproducibility limit, not a data limit, and it is the one place the numbers
+here could fail to reproduce from the stated commands. *Settle it:* bound
+`fetch_poll_runs` at `until`, rebuild, and confirm the counts land where
+they did. Details under Reproduce.
+
 **Task B is not done.** The design doc names a supporting regression task
 (expected delay in seconds, MAE against persistence). `delay_seconds` is
 already carried on `trip_stop_labels` and in the training-set join, so it is
@@ -400,8 +409,9 @@ additive rather than a schema change, but it has not been run.
 ## Reproduce
 
 Requires local Postgres 16 with database `pulse` and the migrations applied.
-The window is pinned by the `--until` boundary, which is what makes the
-numbers above stable while the poller keeps running.
+The `--until` boundary pins which snapshots the label build considers, which
+is what keeps the numbers above stable while the poller keeps running. It is
+not a complete pin, and the gap is named below the commands.
 
 ```bash
 # 0. Schema (idempotent).
@@ -432,12 +442,24 @@ uv run pytest -q          # 148 passed
 uv run mlflow ui --backend-store-uri file:./mlruns
 ```
 
+**Where the pin leaks.** `--until` bounds which `stop_events` snapshots the
+label build considers. It does not bound the gap ledger:
+`pulse/labels.py:fetch_poll_runs` reads all of `poll_runs`, unwindowed,
+because gap intervals are derived from the ledger as it stands at run time.
+So a rerun tomorrow, after the laptop has slept again, sees a gap interval
+opening just past the boundary, and any trip-stop whose trailing settle
+window overlaps it flips to `gap_abutted`. A small number of labels near the
+boundary can move, and the counts downstream with them. The change that
+closes this is bounding the ledger read at `--until` too. It was not made
+here because `poll_runs` already had rows past `20:11:17Z` when the label
+build ran, so bounding it now would reclassify gaps and force a label rebuild
+plus a 30 minute feature rebuild to re-verify.
+
 Rebuilding from scratch rather than incrementally is deliberate here: the
 label table had to be truncated and rebuilt after the service-date grain fix,
 because every row built under the old grain was keyed wrong. Both transforms
 are idempotent and backfillable by window otherwise (`docs/lineage.md`).
 
 `mlruns/` and `models/*.joblib` are gitignored. `models/REGISTRY.md` is the
-durable record and carries the entry for this run, including the git sha the
-run came from. That sha is the code state at run time, not the commit
-carrying this report.
+durable record and carries the entry for this run, including the commit HEAD
+pointed at while it ran.
