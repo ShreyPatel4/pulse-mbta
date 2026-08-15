@@ -52,12 +52,63 @@ tail -f /tmp/pulse-ingest.log        # watch cycles land
 #    min/max polled_at, null rates -- then four PASS/FAIL M1 quality gates
 #    (disk, freshness, volume, null-rate). Exit code 1 if any gate fails.
 uv run python scripts/check.py
+
+# 5. The transform + training pipeline. Pin --until so the numbers stay
+#    stable while the poller keeps running.
+uv run python scripts/build-labels.py \
+  --until 2026-08-15T20:11:17Z --as-of 2026-08-15T20:11:17Z
+uv run python scripts/build-features.py --until 2026-08-15T20:11:17Z
+uv run python scripts/verify-point-in-time.py   # 3 checks, exits 1 on FAIL
+uv run python scripts/train.py                  # metrics, MLflow, register
 ```
 
 Optional: set `MBTA_API_KEY` in the environment before running the poller
 or installing the launchd agent to use a free MBTA key instead of
 anonymous access (raises the rate limit; anonymous is fine at this
 volume).
+
+## Results
+
+Full write-up, including the metrics defense and the limitations, is
+`docs/report.md`. The short version.
+
+The regime: 2.77 days of ingestion (2026-08-12 21:45 to 2026-08-15 16:07 ET),
+10,532,354 `stop_events` rows, 65.0% uptime because the laptop sleeps. Those
+closed into 185,247 labels, of which 142,258 are training-usable, 32,047 were
+excluded as `gap_abutted` and 10,942 as `no_arrival_signal`. 142,239 rows
+reach the training set at a 37.44% late rate. The label is a proxy: the last
+predicted arrival seen before the prediction leaves the feed, minus scheduled
+arrival. Split by time, never randomly: train is Wednesday night through
+Friday (99,590 rows, 38.69% late), test is Saturday (42,649 rows, 34.54%).
+
+| candidate | PR-AUC | recall@P>=0.80 (oracle) | test precision at train-chosen threshold |
+|---|---|---|---|
+| baseline: always-on-time | 0.3454 | n/a | n/a |
+| baseline: route-hour historical rate | 0.4913 | n/a | 0.6514 |
+| baseline: persistence | 0.8636 | 0.8758 | 0.9371 |
+| LogisticRegression | 0.9678 | 0.9373 | 0.7999 |
+| HistGradientBoosting | **0.9711** | **0.9557** | 0.7782 |
+
+Both models beat all three baselines on PR-AUC and on recall at the precision
+floor. Two results cut against that, and both are in the report rather than
+buried:
+
+- **Neither model holds precision >= 0.80 on test at a threshold chosen from
+  training data.** LogisticRegression lands at 0.7999, missing by 0.0001.
+  HistGradientBoosting lands at 0.7782. The ranking transfers to Saturday.
+  The calibration does not.
+- **The features do not honor the design doc's 10-minute horizon.** They are
+  built from settled labels, and a label settles roughly when the bus
+  arrives. Only 0.63% of rows had the persistence input settled 10 minutes
+  before scheduled arrival, and 0.98% for the route-hour aggregate. Every
+  PR-AUC above is an upper bound on what a horizon-honoring model would
+  score. The fix is specified in `docs/report.md`.
+
+The pipeline's own seven-day gate fires at 2.77 days and was left where it
+is. `docs/report.md` has the full "what this cannot say" list: no weekly
+seasonality (4 of 7 day types), one weather regime, 45 of 96 (service date x
+hour) cells empty because of sleep gaps, no spatial holdout, and a named
+experiment for each.
 
 ## Ops: staying alive, and gaps when it doesn't
 

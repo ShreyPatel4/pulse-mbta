@@ -70,6 +70,16 @@ One row per (`service_date_norm`, `route_id`, `direction_id`, `stop_id`,
 `trip_id`) — a *closed* determination about whether that trip-stop ended up
 late, once settled.
 
+**Grain, corrected at M3.** The aggregation that feeds this table groups by
+(`trip_id`, `stop_id`, GTFS service date). Through M2 it grouped by
+(`trip_id`, `stop_id`) alone, which was invisible on a four-hour dataset and
+wrong on a multi-day one: MBTA reuses `trip_id` across service dates, so two
+days of the same scheduled run collapsed into one row. Measured when the
+first full rebuild ran, 17,968 of 172,297 (`trip_id`, `stop_id`) pairs were
+affected. See `pulse/labels.py`'s `_TOUCHED_GROUPS_SQL` comment for the
+measurement and the two properties that make the SQL grouping key and the
+Python-computed `service_date_norm` agree.
+
 - **Producing code:** `pulse/labels.py` (`run_build`,
   `fetch_touched_groups`, `derive_label_row`, `compute_gap_intervals`,
   `service_date_norm`) via `scripts/build-labels.py`. Schema:
@@ -126,6 +136,27 @@ truth lives).
   regression like the join predicate silently matching nothing). Recorded
   to `transform_runs` (`transform_name='build_features'`) via
   `pulse/features.py:record_transform_run`.
+- **Point-in-time verification (added M3):**
+  `scripts/verify-point-in-time.py` runs three checks against the live table
+  and exits non-zero on any failure. It recomputes every row's route-hour
+  aggregate a structurally different way (a `GROUPS`-framed window function)
+  and requires zero disagreements, requires the NULL count to equal the count
+  of rows tied-earliest in their (route, hour) bucket, and requires no row to
+  have a contributing label scheduled at or after itself. The durable
+  companion is `tests/test_features.py`'s mutation test, which inserts future
+  labels and asserts an earlier row's features do not move.
+- **`current_delay_persistence_seconds` is scoped to one service date**
+  (added M3, alongside the label grain fix): without it, the first stop of
+  trip T today inherited its "current delay" from the last stop of trip T
+  yesterday.
+- **What this layer does NOT guarantee:** availability at the design doc's
+  10-minute prediction horizon. Every feature here is built from *settled*
+  labels, and a label settles roughly when the bus arrives. Measured on the
+  142,239-row M3 training set, only 0.63% of rows had the persistence input
+  settled 10 minutes before scheduled arrival, and 0.98% for the route-hour
+  aggregate. Point-in-time correct and horizon-honoring are different
+  properties; this layer has the first and not the second. Stated with the
+  numbers, and with the fix, in `docs/report.md`.
 
 ## 4. Training set
 
@@ -133,16 +164,29 @@ Not a persisted table — the join `scripts/train.py` builds at run time.
 
 - **Producing code:** `scripts/train.py`'s `_TRAINING_SET_SQL`
   (`features_trip_stop JOIN trip_stop_labels_training ... ORDER BY
-  scheduled_arrival`) plus `pulse/train.py` (`temporal_split`,
-  `baseline_scores`, `build_models`) and `pulse/metrics.py` (`pr_auc`,
-  `recall_at_precision`).
+  scheduled_arrival` plus a full natural-key tiebreak) with `pulse/train.py`
+  (`temporal_split`, `split_summary`, `baseline_scores`,
+  `frozen_route_hour_late_rate`, `build_models`) and `pulse/metrics.py`
+  (`pr_auc`, `roc_auc`, `recall_at_precision`, `threshold_for_precision`,
+  `confusion_at_threshold`).
 - **Contract:** the temporal split itself is the load-bearing guarantee —
   `pulse/train.py:temporal_split` takes the first `TRAIN_FRACTION` of rows
   by `scheduled_arrival` order, never a random split, so evaluation never
   happens on data chronologically interleaved with its own training data.
+  The cut is then pushed forward to the next change of `scheduled_arrival`,
+  so no single minute lands on both sides; with a total order in SQL, that
+  makes two consecutive runs byte-identical (before both, the boundary
+  minute's rows were ordered arbitrarily by Postgres and the train late rate
+  moved between runs).
   `baseline_route_hour_rate`'s NaN fallback is computed from the **train**
   split's late rate only, never test — the one place this layer could leak
   test-set outcomes into a "baseline" if it weren't deliberate.
+- **Thresholds are chosen on train, never on test.**
+  `metrics.threshold_for_precision` picks the lowest cutoff clearing
+  precision 0.80 on the *train* split; the confusion matrix reported is what
+  that frozen cutoff did on test. `recall_at_precision` on test is reported
+  alongside it, labelled as the oracle number it is: it searches thresholds
+  on the data it scores, so nothing deployable reaches it.
 - **Gates:** the `PRELIMINARY - insufficient data for the report
   deliverable` banner (`window_days < 7`) is this layer's quality gate — it
   runs every time, prints loudly, and is written into
@@ -151,13 +195,14 @@ Not a persisted table — the join `scripts/train.py` builds at run time.
   doc's bar — "provably beats guessing" — is comparative against the 3
   baselines, judged by a human reading `models/REGISTRY.md`, not a fixed
   number a script can gate on alone).
-- **Honest caveat carried into every PRELIMINARY run:**
-  `route_hour_historical_late_rate` is point-in-time correct by
-  construction, but with only a few hours of real spread, "strictly
-  earlier" is nearly the same window the model is then scored against. A
-  high PR-AUC this early is evidence of that adjacency, not of model skill
-  — `scripts/train.py` prints this explicitly and `models/REGISTRY.md`
-  carries the same note on every entry where `window_days < 7`.
+- **The adjacency caveat, now measured instead of hedged.** M2 warned that
+  `route_hour_historical_late_rate`'s "strictly earlier" window was nearly
+  the window the model is then scored against, so a high PR-AUC might be
+  measuring that adjacency rather than skill. M3 turned it into a number.
+  `pulse/train.py:frozen_route_hour_late_rate` computes the aggregate once
+  from the train split, freezes it, and applies it to test, which removes the
+  overlap entirely. Every run reports both. On the 2.77-day window the frozen
+  version costs 0.0007 PR-AUC. The worry was real and it is small.
 
 ## What's out of scope here
 
