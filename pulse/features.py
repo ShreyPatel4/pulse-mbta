@@ -41,6 +41,15 @@ import psycopg
 # "most recent earlier scheduled_arrival, same trip" is equivalent to "the
 # previous stop" for any trip that hasn't looped back on itself (city bus
 # routes in this dataset don't).
+#
+# It is also scoped to the same service_date_norm (added at M3, alongside the
+# matching grain fix in pulse.labels). MBTA reuses trip_id across service
+# dates, so without that predicate the first stop of trip T today would
+# inherit its "current delay" from the LAST stop of trip T yesterday -- a
+# different bus, a different driver, twenty hours earlier. Point-in-time
+# correct either way (it is still strictly-earlier data), but not the feature
+# the name claims. Scoped, the first stop of each trip-day is NULL instead,
+# which is the truth: at that stop there is no earlier delay to carry forward.
 _BUILD_FEATURES_SQL = """
 INSERT INTO features_trip_stop (
     service_date_norm, route_id, direction_id, stop_id, trip_id,
@@ -69,6 +78,7 @@ SELECT
         SELECT p.delay_seconds
         FROM trip_stop_labels_training p
         WHERE p.trip_id = l.trip_id
+          AND p.service_date_norm = l.service_date_norm
           AND p.scheduled_arrival < l.scheduled_arrival
         ORDER BY p.scheduled_arrival DESC
         LIMIT 1

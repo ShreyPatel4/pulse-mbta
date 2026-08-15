@@ -28,6 +28,11 @@ case the observed data doesn't currently exercise, e.g. an ADDED trip with a
 live prediction but no GTFS schedule counterpart, documented in
 migrations/005's header). Never imputed as on-time.
 
+GRAIN: one label row per (trip_id, stop_id, GTFS service date), not per
+(trip_id, stop_id). MBTA reuses trip_id across service dates. See
+_TOUCHED_GROUPS_SQL's comment for the measurement that caught this and why
+M2's four-hour window could never have shown it.
+
 SERVICE_DATE_NORM (item 5): the GTFS service day runs to ~3 AM, so a raw
 polled_at calendar date splits late-night trips at midnight. service_date is
 normalized to America/New_York local time with hours < 3 belonging to the
@@ -234,36 +239,68 @@ def derive_label_row(
 
 # -- DB orchestration (scripts/build-labels.py's CLI wraps run_build) ------
 
-# Two-step query, deliberately: step 1 (the `touched` CTE) finds which
-# trip-stops to CONSIDER this run (any snapshot in [since, until)); step 2
-# aggregates each touched trip-stop's ENTIRE stop_events history, not just
-# the window slice. This is what makes derive_label_row's output
-# rerun-stable across two different, overlapping backfill windows (see the
-# module docstring's SERVICE_DATE_NORM section) -- a trip-stop reprocessed
-# from two different windows gets byte-identical aggregates both times,
-# because the aggregation itself never depends on the window boundaries,
-# only on which trip-stops get selected for consideration.
+# GRAIN (fixed 2026-08-15, at the start of M3, when the first multi-day
+# rebuild exposed it): the group key is (trip_id, stop_id, gtfs_service_date),
+# NOT (trip_id, stop_id). MBTA reuses trip_id across service dates -- measured
+# on this database, 17,968 of 172,297 (trip_id, stop_id) pairs had snapshots
+# more than 6 hours apart, and sampling them showed two distinct
+# scheduled_arrival values under one trip_id: the same scheduled run on two
+# different days. Grouping without the service date merges those days into one
+# row whose observed_span straddles both and whose final_predicted_arrival
+# comes from whichever day was later. That produces a wrong label that still
+# looks plausible. This never surfaced in M2 because M2's whole dataset was
+# four hours long, inside which a trip_id cannot recur.
+#
+# The service date is derived per row by the same GTFS 3AM rule
+# service_date_norm() applies in Python (local time minus 3 hours, then take
+# the date), anchored on scheduled_arrival when present and polled_at
+# otherwise -- the same precedence derive_label_row uses, so the SQL grouping
+# key and the Python-computed service_date_norm always agree. Two properties
+# make that true and both are verified on the live table: no (trip_id,
+# stop_id) pair mixes null and non-null scheduled_arrival (0 rows), and no
+# group carries more than one distinct scheduled_arrival (0 rows).
+#
+# `touched` is now a bool_or over each group rather than a separate CTE and a
+# self-join: a group is considered this run if ANY of its snapshots falls in
+# [since, until), while the aggregates still cover the group's ENTIRE
+# stop_events history. That is the same two-step meaning as before (and the
+# same rerun-stability guarantee -- see the module docstring's
+# SERVICE_DATE_NORM section: a group reprocessed from two different
+# overlapping windows gets byte-identical aggregates both times, because the
+# aggregation never depends on the window boundaries, only on which groups get
+# selected), expressed as one pass over stop_events instead of two. Measured
+# at 10.5M rows: 13.5s.
 _TOUCHED_GROUPS_SQL = """
-WITH touched AS (
-    SELECT DISTINCT trip_id, stop_id
+WITH scoped AS (
+    SELECT
+        trip_id, stop_id, route_id, direction_id,
+        scheduled_arrival, predicted_arrival, polled_at,
+        ((CASE WHEN scheduled_arrival IS NOT NULL THEN scheduled_arrival ELSE polled_at END
+          AT TIME ZONE 'America/New_York') - interval '3 hours')::date AS gtfs_service_date
     FROM stop_events
-    WHERE polled_at >= %(since)s AND polled_at < %(until)s
+), agg AS (
+    SELECT
+        trip_id,
+        stop_id,
+        gtfs_service_date,
+        (array_agg(route_id ORDER BY polled_at DESC))[1] AS route_id,
+        (array_agg(direction_id ORDER BY polled_at DESC))[1] AS direction_id,
+        (array_agg(scheduled_arrival ORDER BY polled_at DESC)
+            FILTER (WHERE scheduled_arrival IS NOT NULL))[1] AS scheduled_arrival,
+        (array_agg(predicted_arrival ORDER BY polled_at DESC)
+            FILTER (WHERE predicted_arrival IS NOT NULL))[1] AS final_predicted_arrival,
+        min(polled_at) AS observed_span_start,
+        max(polled_at) AS observed_span_end,
+        count(*) AS n_snapshots,
+        bool_or(polled_at >= %(since)s AND polled_at < %(until)s) AS touched
+    FROM scoped
+    GROUP BY trip_id, stop_id, gtfs_service_date
 )
 SELECT
-    se.trip_id,
-    se.stop_id,
-    (array_agg(se.route_id ORDER BY se.polled_at DESC))[1] AS route_id,
-    (array_agg(se.direction_id ORDER BY se.polled_at DESC))[1] AS direction_id,
-    (array_agg(se.scheduled_arrival ORDER BY se.polled_at DESC)
-        FILTER (WHERE se.scheduled_arrival IS NOT NULL))[1] AS scheduled_arrival,
-    (array_agg(se.predicted_arrival ORDER BY se.polled_at DESC)
-        FILTER (WHERE se.predicted_arrival IS NOT NULL))[1] AS final_predicted_arrival,
-    min(se.polled_at) AS observed_span_start,
-    max(se.polled_at) AS observed_span_end,
-    count(*) AS n_snapshots
-FROM stop_events se
-JOIN touched t ON t.trip_id = se.trip_id AND t.stop_id = se.stop_id
-GROUP BY se.trip_id, se.stop_id
+    trip_id, stop_id, route_id, direction_id, scheduled_arrival, final_predicted_arrival,
+    observed_span_start, observed_span_end, n_snapshots
+FROM agg
+WHERE touched
 """
 
 _POLL_RUNS_SQL = "SELECT polled_at, error FROM poll_runs ORDER BY polled_at"
@@ -313,10 +350,11 @@ MIN_TRAINING_LABEL_RATE_PCT = 50.0  # rows_written that are training-usable (clo
 def fetch_touched_groups(
     conn: psycopg.Connection, since: dt.datetime | None, until: dt.datetime
 ) -> list[dict[str, Any]]:
-    """Every trip-stop with at least one stop_events row in [since, until),
-    each aggregated over its FULL stop_events history (see _TOUCHED_GROUPS_SQL's
-    comment). since=None means no lower bound (all of history is eligible to
-    be "touched")."""
+    """Every (trip_id, stop_id, GTFS service date) group with at least one
+    stop_events row in [since, until), each aggregated over its FULL
+    stop_events history (see _TOUCHED_GROUPS_SQL's comment for the grain and
+    the rerun-stability argument). since=None means no lower bound (all of
+    history is eligible to be "touched")."""
     since_value = since or _NO_LOWER_BOUND
     with conn.cursor() as cur:
         cur.execute(_TOUCHED_GROUPS_SQL, {"since": since_value, "until": until})

@@ -330,6 +330,85 @@ def test_not_yet_settled_trip_stop_is_skipped_this_run(conn):
     assert _label_row(conn, "trip-inflight") is None
 
 
+# -- grain: trip_id is reused across service dates ----------------------------
+
+
+def test_same_trip_id_on_two_service_dates_produces_two_labels(conn):
+    # MBTA reuses trip_id across service dates. Measured on the live database
+    # at the start of M3: 17,968 of 172,297 (trip_id, stop_id) pairs had
+    # snapshots more than 6 hours apart, and those pairs carried two distinct
+    # scheduled_arrival values -- the same scheduled run on two different
+    # days. Grouped on (trip_id, stop_id) alone, the two days collapse into
+    # one row whose final_predicted_arrival comes from whichever day was
+    # later, i.e. a wrong label that still looks plausible. The group key
+    # carries the GTFS service date so they stay separate.
+    #
+    # Day 1: 60s late. Day 2, same trip_id and stop_id: 600s late. If the
+    # grain were wrong, day 1's row would vanish and the surviving row would
+    # read 600s.
+    day1 = dt.datetime(2026, 8, 13, 16, 0, 0, tzinfo=_UTC)
+    day2 = day1 + dt.timedelta(days=1)
+
+    for base, lateness in ((day1, 60), (day2, 600)):
+        for i in range(4):
+            _insert_stop_event(
+                conn,
+                trip_id="trip-recurring",
+                polled_at=base + i * _CYCLE,
+                scheduled_arrival=base,
+                predicted_arrival=base + dt.timedelta(seconds=lateness),
+            )
+        _seed_continuous_poll_runs(conn, base, count=15)
+
+    as_of = day2 + 3 * _CYCLE + dt.timedelta(seconds=900)
+    labels.run_build(conn, since=None, until=as_of, as_of=as_of)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT service_date_norm, delay_seconds, late, n_snapshots FROM trip_stop_labels "
+            "WHERE trip_id = 'trip-recurring' ORDER BY service_date_norm"
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 2
+    # Each day keeps its own snapshots (4, not 8) and its own delay.
+    assert rows[0] == (day1.astimezone(_EASTERN).date(), 60, False, 4)
+    assert rows[1] == (day2.astimezone(_EASTERN).date(), 600, True, 4)
+
+
+def test_observed_span_does_not_straddle_two_service_dates(conn):
+    # The span is what is_settled and gap_abuts are evaluated against. A
+    # merged group's observed_span_start would sit a day before its
+    # observed_span_end, which would make a day-old trip-stop look like it
+    # was observed continuously for 24 hours.
+    day1 = dt.datetime(2026, 8, 13, 12, 0, 0, tzinfo=_UTC)
+    day2 = day1 + dt.timedelta(days=1)
+
+    for base in (day1, day2):
+        for i in range(3):
+            _insert_stop_event(
+                conn,
+                trip_id="trip-span",
+                polled_at=base + i * _CYCLE,
+                scheduled_arrival=base,
+                predicted_arrival=base + dt.timedelta(seconds=30),
+            )
+        _seed_continuous_poll_runs(conn, base, count=15)
+
+    as_of = day2 + 2 * _CYCLE + dt.timedelta(seconds=900)
+    labels.run_build(conn, since=None, until=as_of, as_of=as_of)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT observed_span_end - observed_span_start FROM trip_stop_labels "
+            "WHERE trip_id = 'trip-span'"
+        )
+        spans = [row[0] for row in cur.fetchall()]
+
+    assert len(spans) == 2
+    assert all(span < dt.timedelta(hours=1) for span in spans), spans
+
+
 # -- idempotent rerun over a DIFFERENT, OVERLAPPING window --------------------
 
 
